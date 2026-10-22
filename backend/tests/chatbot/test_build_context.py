@@ -16,7 +16,17 @@ still includes content from every thread.
 
 import pytest
 
-from chatbot.retriever import build_context
+from chatbot import retriever
+
+
+def build_context(threads, question, **kwargs):
+    """build_context with every setting passed explicitly (no Settings/.env),
+    and no thread limit so these tests still see all three threads."""
+    kwargs.setdefault("budget_chars", 4000)
+    kwargs.setdefault("max_threads", 10)
+    kwargs.setdefault("table_fraction", 0.5)
+    kwargs.setdefault("ignore_words", set())
+    return retriever.build_context(threads, question, **kwargs)
 
 
 # A block of quoted reply history that is pasted verbatim into every thread.

@@ -811,14 +811,117 @@ class Settings(BaseSettings):
         alias="CHATBOT_LLM_NUM_CTX",
         validation_alias="CHATBOT_LLM_NUM_CTX",
     )
+    # Sampling / runtime options sent to Ollama for chatbot answers. Both the
+    # non-streaming and streaming paths read them through one helper
+    # (chatbot.service._chat_request). temperature 0 + repeat_penalty 1.0 keep
+    # figures copied digit for digit (no sampling noise, no penalty on repeated
+    # digits).
+    chatbot_temperature: float = Field(
+        default=0.0,
+        alias="CHATBOT_TEMPERATURE",
+        validation_alias="CHATBOT_TEMPERATURE",
+    )
+    chatbot_repeat_penalty: float = Field(
+        default=1.0,
+        alias="CHATBOT_REPEAT_PENALTY",
+        validation_alias="CHATBOT_REPEAT_PENALTY",
+    )
+    # CPU threads for generation: set to the server's PHYSICAL core count.
+    chatbot_num_thread: int = Field(
+        default=8,
+        alias="CHATBOT_NUM_THREAD",
+        validation_alias="CHATBOT_NUM_THREAD",
+    )
+    # Seconds Ollama keeps the model loaded after a request (-1 = forever).
+    chatbot_keep_alive: int = Field(
+        default=-1,
+        alias="CHATBOT_KEEP_ALIVE",
+        validation_alias="CHATBOT_KEEP_ALIVE",
+    )
+    # Plain-text file holding the chatbot system prompt. A relative path is
+    # resolved against the backend root. The file is re-read when it changes,
+    # so edits apply without a restart. A missing/empty file is an error (no
+    # silent fallback to a built-in prompt).
+    chatbot_system_prompt_path: str = Field(
+        default="chatbot/system_prompt.txt",
+        alias="CHATBOT_SYSTEM_PROMPT_PATH",
+        validation_alias="CHATBOT_SYSTEM_PROMPT_PATH",
+    )
+    # Model routing. With CHATBOT_MODEL_ROUTING off (default) every question
+    # uses CHATBOT_LLM_MODEL, exactly as before. With it on, questions that ask
+    # for a number (matched by CHATBOT_NUMERIC_QUESTION_PATTERN) go to the
+    # accurate model and every other question goes to the fast model.
+    chatbot_model_routing: bool = Field(
+        default=False,
+        alias="CHATBOT_MODEL_ROUTING",
+        validation_alias="CHATBOT_MODEL_ROUTING",
+    )
+    chatbot_llm_model_fast: str = Field(
+        default="llama3b-fast:latest",
+        alias="CHATBOT_LLM_MODEL_FAST",
+        validation_alias="CHATBOT_LLM_MODEL_FAST",
+    )
+    chatbot_llm_model_accurate: str = Field(
+        default="llama8b-fast:latest",
+        alias="CHATBOT_LLM_MODEL_ACCURATE",
+        validation_alias="CHATBOT_LLM_MODEL_ACCURATE",
+    )
+    # Regex (case-insensitive) that marks a question as asking for a number.
+    chatbot_numeric_question_pattern: str = Field(
+        default=r"\bhow\s+(much|many)\b|\bwhat\s+(percentage|percent)\b",
+        alias="CHATBOT_NUMERIC_QUESTION_PATTERN",
+        validation_alias="CHATBOT_NUMERIC_QUESTION_PATTERN",
+    )
     # Character budget for the compact, deduplicated RAG context sent to the
-    # chatbot LLM (chatbot.retriever.build_context). ~8000 chars ≈ 2000 tokens
-    # keeps the whole prompt under the model's context window so Ollama never
-    # logs "truncating input prompt". Editable via CHATBOT_CONTEXT_MAX_CHARS.
+    # chatbot LLM (chatbot.retriever.build_context). ~4000 chars ≈ 1000 tokens;
+    # with the short system prompt the whole prompt stays near 1,000-1,500
+    # tokens. Editable via CHATBOT_CONTEXT_MAX_CHARS.
     chatbot_context_max_chars: int = Field(
-        default=8000,
+        default=4000,
         alias="CHATBOT_CONTEXT_MAX_CHARS",
         validation_alias="CHATBOT_CONTEXT_MAX_CHARS",
+    )
+    # Max number of retrieved threads that build_context may put in the prompt
+    # (best-ranked threads that share a real keyword with the question). This
+    # only trims what is SENT to the LLM; retrieval itself is unchanged.
+    chatbot_context_top_threads: int = Field(
+        default=2,
+        alias="CHATBOT_CONTEXT_TOP_THREADS",
+        validation_alias="CHATBOT_CONTEXT_TOP_THREADS",
+    )
+    # Share of the context budget reserved for table rows (never dropped by the
+    # noise filter, length rule, dedup or scoring). Rows are cut only when they
+    # exceed this share, and a WARNING with the thread subject is logged.
+    chatbot_context_table_fraction: float = Field(
+        default=0.5,
+        alias="CHATBOT_CONTEXT_TABLE_FRACTION",
+        validation_alias="CHATBOT_CONTEXT_TABLE_FRACTION",
+    )
+    # Comma-separated extra words ignored when matching question words to
+    # emails (on top of the built-in stopword/generic-word lists).
+    chatbot_context_ignore_words: str = Field(
+        default="",
+        alias="CHATBOT_CONTEXT_IGNORE_WORDS",
+        validation_alias="CHATBOT_CONTEXT_IGNORE_WORDS",
+    )
+    # Hard ceiling on the assembled user message (context + question), in
+    # characters. Above it the context is rebuilt once with a smaller budget.
+    chatbot_prompt_char_ceiling: int = Field(
+        default=6000,
+        alias="CHATBOT_PROMPT_CHAR_CEILING",
+        validation_alias="CHATBOT_PROMPT_CHAR_CEILING",
+    )
+    # Factor applied to the context budget on that single rebuild.
+    chatbot_prompt_shrink_factor: float = Field(
+        default=0.6,
+        alias="CHATBOT_PROMPT_SHRINK_FACTOR",
+        validation_alias="CHATBOT_PROMPT_SHRINK_FACTOR",
+    )
+    # Log a WARNING when Ollama reports more prompt tokens than this.
+    chatbot_prompt_warn_tokens: int = Field(
+        default=2500,
+        alias="CHATBOT_PROMPT_WARN_TOKENS",
+        validation_alias="CHATBOT_PROMPT_WARN_TOKENS",
     )
     # Debug aid: when true, the chatbot dumps the EXACT final prompt (system +
     # context + question) and the RAW LLM answer (before the hallucination

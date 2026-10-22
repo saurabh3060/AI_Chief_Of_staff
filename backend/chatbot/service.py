@@ -14,11 +14,13 @@ Ported from the standalone chatbot_final project's chatbot.py, adapted to:
 """
 
 import asyncio
+import hashlib
 import json
 import queue
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Generator
 
 import ollama
@@ -26,9 +28,9 @@ import ollama
 from chatbot.postgres_store import save_chat_message
 from chatbot.redis_history import save_message
 from chatbot.redis_qa_cache import get_cached_answer, set_cached_answer
-from chatbot.retriever import format_context, retrieve_weaviate
+from chatbot.retriever import retrieve_weaviate
 from chatbot.schema import ChatResponse, SourceInfo, TimingInfo
-from core.config import get_settings
+from core.config import BACKEND_ROOT, get_settings
 from core.db import get_main_loop
 from core.logging_config import get_agent_logger
 from core.utils import sanitize_log_input
@@ -36,30 +38,66 @@ from core.utils import sanitize_log_input
 logger = get_agent_logger("chatbot")
 
 
-SYSTEM_PROMPT = """You are a concise email and meeting assistant. You are given real email threads as context covering all business units — including Wholesale Banking, Retail, Credit Cards, Liabilities, and any other topics present in the emails.
+def _resolve_prompt_path(raw: str) -> Path:
+    """Relative prompt paths are resolved against the backend root."""
+    path = Path(raw)
+    return path if path.is_absolute() else BACKEND_ROOT / path
 
-CRITICAL ANTI-HALLUCINATION RULE (HIGHEST PRIORITY):
-- You MUST answer ONLY from the email context provided below. If the context does not contain information about what the user is asking, respond with EXACTLY: "Not found in the provided emails."
-- NEVER describe your own capabilities, features, or what you can help with.
-- NEVER say things like "I can provide insights on", "I'm here to help you", "I can help you navigate", "What would you like to focus on", or anything similar.
-- NEVER invent, assume, or hallucinate any information, names, numbers, or facts that are not explicitly written in the provided email context.
-- If you are unsure whether the context answers the question, say "Not found in the provided emails." — do NOT guess.
 
-STRICT RULES — follow every one:
-1. Answer in 8-9 lines maximum. No exceptions.
-2. Always include exact figures, names, dates, and percentages as they appear in the emails — never round or omit them.
-3. Answer from what is written in the emails. You may paraphrase and connect related points — but never invent facts, people, or numbers not present in the context. If genuinely nothing relevant exists in the provided emails, say "Not found in the provided emails."
-4. Do not repeat the question, do not add preamble like "According to Email 1", do not add conclusions or summaries beyond what was asked.
-5. If the question asks for action items, list them as bullet points with owner and due date — still within 7 lines total.
-6. Do not explain what the email is about or who sent it unless that is what was asked.
-7. If the question specifies a number of items (e.g. "two areas", "three reasons"), list exactly that many as separately numbered points. Each point must be distinct — do not split one idea into two, and do not merge two different ideas into one.
-8. If the emails show a question being raised but never answered — no one named accounts, no plan was given, no response was provided — say explicitly: "The emails raise this question but no answer was provided." Do not fill the silence with related numbers or context from the email.
-9. Read ALL provided emails before answering. If multiple emails contain different figures or answers for the same metric, use the one from the email whose content is most specific and directly answers the question — do not default to the first email.
-10. When the question asks for a specific number, duration, quantity, or percentage (e.g. "how much", "how many", "how long", "what percentage") — state that exact figure first, before any explanation. Do not lead with qualitative context when a specific number exists in the emails.
-11. PERIOD-SPECIFIC FIGURES — CRITICAL: Every number in the emails belongs only to the exact month, quarter, or period it is explicitly labeled with. A figure labeled "March" is ONLY the answer for a question about March. It is NEVER the answer for April, February, June, or any other period. If the question asks about April sanctions and the emails only show March sanctions, say: "April sanctions are not found in the provided emails." Do not substitute, reuse, or carry over any figure from one period to answer a question about a different period.
-12. If the question asks about a specific time period (month, quarter, year) and no figure is explicitly labeled with that exact period in the emails, say: "Not found in the provided emails for that period." Never infer, estimate, or borrow a figure from an adjacent period.
+_prompt_cache: dict = {"path": None, "mtime": None, "text": ""}
 
-FINAL REMINDER: If the provided email context does not discuss the topic the user asked about, your ONLY allowed response is: "Not found in the provided emails." Do NOT describe yourself or your capabilities. Do NOT make up an answer."""
+
+def get_system_prompt() -> str:
+    """Return the chatbot system prompt from CHATBOT_SYSTEM_PROMPT_PATH.
+
+    Re-reads the file when its mtime changes. Raises RuntimeError when the file
+    is missing or empty so a bad deployment fails loudly instead of silently
+    answering with a different prompt. Logs path, size and a short hash on each
+    (re)load so the prompt a running server actually uses can be confirmed.
+    """
+    path = _resolve_prompt_path(get_settings().chatbot_system_prompt_path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError as e:
+        raise RuntimeError(f"Chatbot system prompt file not readable: {path} ({e})") from e
+
+    if _prompt_cache["path"] == path and _prompt_cache["mtime"] == mtime:
+        return _prompt_cache["text"]
+
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        raise RuntimeError(f"Chatbot system prompt file is empty: {path}")
+
+    _prompt_cache.update(path=path, mtime=mtime, text=text)
+    logger.info(
+        "Chatbot system prompt loaded: path=%s chars=%d sha256=%s",
+        path, len(text), hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
+    )
+    return text
+
+
+def _chat_request(user_message: str, model: str) -> dict:
+    """Keyword arguments for ``ollama.Client.chat`` - the single place that
+    decides messages, options and keep_alive for both the streaming and
+    non-streaming paths (``model`` comes from ``_select_model``). Every value
+    comes from Settings / the prompt file."""
+    settings = get_settings()
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": get_system_prompt()},
+            {"role": "user", "content": user_message},
+        ],
+        "options": {
+            "num_predict": settings.chatbot_max_tokens,
+            "temperature": settings.chatbot_temperature,
+            "repeat_penalty": settings.chatbot_repeat_penalty,
+            "num_ctx": settings.chatbot_llm_num_ctx,
+            "num_thread": settings.chatbot_num_thread,
+        },
+        "keep_alive": settings.chatbot_keep_alive,
+    }
+
 
 GREETING_RESPONSE = (
     "Hi! I'm your Meeting, Email & Document Assistant. I can dig through your meeting summaries, "
@@ -69,15 +107,29 @@ GREETING_RESPONSE = (
 
 NOT_FOUND_RESPONSE = "Not found in the provided emails."
 
-# Hard ceiling on the assembled prompt (system + context + question). If the
-# built prompt exceeds this many characters we shrink the context budget and
-# rebuild ONCE before calling the LLM, so we never rely on Ollama truncating
-# the input (which drops whole threads and corrupts answers).
-PROMPT_CHAR_CEILING = 13000
-# Fraction to shrink the context budget by on the single rebuild.
-PROMPT_SHRINK_FACTOR = 0.6
-# Warn when Ollama reports it evaluated more prompt tokens than this.
-PROMPT_EVAL_WARN_TOKENS = 3500
+def _wants_number(query: str) -> bool:
+    """True when the question asks for a figure (CHATBOT_NUMERIC_QUESTION_PATTERN)."""
+    pattern = get_settings().chatbot_numeric_question_pattern
+    try:
+        return re.search(pattern, query, re.IGNORECASE) is not None
+    except re.error as e:
+        logger.warning("Invalid CHATBOT_NUMERIC_QUESTION_PATTERN %r: %s", pattern, e)
+        return False
+
+
+def _select_model(query: str) -> str:
+    """Pick the chat model for this question.
+
+    CHATBOT_MODEL_ROUTING off (default): always CHATBOT_LLM_MODEL, as before.
+    On: the accurate model for questions that ask for a number, the fast model
+    for everything else.
+    """
+    settings = get_settings()
+    if not settings.chatbot_model_routing:
+        return settings.chatbot_llm_model
+    if _wants_number(query):
+        return settings.chatbot_llm_model_accurate
+    return settings.chatbot_llm_model_fast
 
 
 def _build_user_message(context: str, query: str) -> str:
@@ -89,36 +141,39 @@ def _build_user_message(context: str, query: str) -> str:
     )
 
 
-def _build_prompt_with_guard(retrieved: list[dict], query: str) -> tuple[str, str]:
-    """Return (context, user_message), rebuilding once with a smaller budget
-    if the assembled prompt exceeds PROMPT_CHAR_CEILING.
+def _build_prompt_with_guard(retrieved: list[dict], query: str) -> tuple[str, str, dict]:
+    """Return (context, user_message, stats), rebuilding once with a smaller
+    budget if the assembled prompt exceeds CHATBOT_PROMPT_CHAR_CEILING.
 
     Never depends on Ollama truncation: if the first build is too large we
     rebuild the context with a reduced ``budget_chars`` a single time.
+    ``stats`` carries build_context's diagnostics (threads in/used, table rows
+    kept/cut, per-thread line counts) for the per-request metrics log.
 
     When CHATBOT_DEBUG_PROMPT is on, logs which threads were retrieved
     (subject + rank) and how many sentences build_context kept per thread.
     """
     from chatbot.retriever import build_context
 
+    settings = get_settings()
     stats: dict = {}
     context = build_context(retrieved, query, stats=stats)
     user_message = _build_user_message(context, query)
 
-    if len(user_message) > PROMPT_CHAR_CEILING:
-        settings = get_settings()
-        shrunk = max(1000, int(settings.chatbot_context_max_chars * PROMPT_SHRINK_FACTOR))
+    if len(user_message) > settings.chatbot_prompt_char_ceiling:
+        shrunk = max(1, int(settings.chatbot_context_max_chars * settings.chatbot_prompt_shrink_factor))
         logger.warning(
             "Built prompt %d chars > ceiling %d - rebuilding context once with budget_chars=%d",
-            len(user_message), PROMPT_CHAR_CEILING, shrunk,
+            len(user_message), settings.chatbot_prompt_char_ceiling, shrunk,
         )
         stats = {}
         context = build_context(retrieved, query, budget_chars=shrunk, stats=stats)
         user_message = _build_user_message(context, query)
 
+    stats["context_chars"] = len(context)
     _debug_log_retrieval(retrieved, stats)
 
-    return context, user_message
+    return context, user_message, stats
 
 
 def _debug_enabled() -> bool:
@@ -165,7 +220,7 @@ def _debug_dump_prompt(user_message: str, raw_answer: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         contents = (
             "===== SYSTEM PROMPT =====\n"
-            f"{SYSTEM_PROMPT}\n\n"
+            f"{get_system_prompt()}\n\n"
             "===== USER MESSAGE (context + question) =====\n"
             f"{user_message}\n\n"
             "===== RAW LLM ANSWER (pre hallucination/NOT_FOUND) =====\n"
@@ -189,14 +244,20 @@ def _ns_to_s(value) -> float:
 def _log_llm_metrics(
     response_obj,
     *,
+    model: str,
     prompt_chars: int,
     retrieval_ms: float,
+    stats: dict,
+    first_token_s: float | None = None,
 ) -> None:
     """Log one metrics line per request from the Ollama response object.
 
-    Logs prompt_chars, prompt_eval_count, prompt_eval_duration (s),
-    eval_count, eval_duration (s), tokens/s and retrieval time. Emits a
-    WARNING if prompt_eval_count exceeds PROMPT_EVAL_WARN_TOKENS.
+    Logs model, thread count (used/retrieved), kept context characters,
+    prompt tokens (Ollama's prompt_eval_count), time to first token, eval
+    count/duration, tokens/s and retrieval time. ``first_token_s`` is the
+    measured time to the first streamed token; when it is None (non-streaming
+    call) it is estimated as load_duration + prompt_eval_duration. Emits a
+    WARNING if prompt_eval_count exceeds CHATBOT_PROMPT_WARN_TOKENS.
     """
     def _get(key, default=0):
         if isinstance(response_obj, dict):
@@ -208,18 +269,26 @@ def _log_llm_metrics(
     prompt_eval_s = _ns_to_s(_get("prompt_eval_duration", 0))
     eval_s = _ns_to_s(_get("eval_duration", 0))
     tokens_per_sec = round(eval_count / eval_s, 1) if eval_s > 0 else 0.0
+    if first_token_s is None:
+        ttft_s, ttft_src = round(_ns_to_s(_get("load_duration", 0)) + prompt_eval_s, 2), "est"
+    else:
+        ttft_s, ttft_src = round(first_token_s, 2), "measured"
 
     logger.info(
-        "LLM metrics: prompt_chars=%d prompt_eval_count=%d prompt_eval_duration=%.2fs "
+        "LLM metrics: model=%s threads=%d/%d context_chars=%d prompt_chars=%d "
+        "prompt_tokens=%d first_token=%.2fs(%s) prompt_eval_duration=%.2fs "
         "eval_count=%d eval_duration=%.2fs tokens_per_sec=%.1f retrieval=%.1fms",
-        prompt_chars, prompt_eval_count, prompt_eval_s,
+        model, stats.get("threads_used", 0), stats.get("threads_in", 0),
+        stats.get("context_chars", 0), prompt_chars,
+        prompt_eval_count, ttft_s, ttft_src, prompt_eval_s,
         eval_count, eval_s, tokens_per_sec, retrieval_ms,
     )
-    if prompt_eval_count > PROMPT_EVAL_WARN_TOKENS:
+    warn_tokens = get_settings().chatbot_prompt_warn_tokens
+    if prompt_eval_count > warn_tokens:
         logger.warning(
             "prompt_eval_count=%d exceeds %d - prompt is still too large; "
-            "reduce CHATBOT_CONTEXT_MAX_CHARS",
-            prompt_eval_count, PROMPT_EVAL_WARN_TOKENS,
+            "reduce CHATBOT_CONTEXT_MAX_CHARS or CHATBOT_CONTEXT_TOP_THREADS",
+            prompt_eval_count, warn_tokens,
         )
 
 
@@ -540,10 +609,6 @@ async def answer_question(
     retrieved, retriever_label = _retrieve_for_query(query, bm25_index, wv_client)
     timings["retrieval"] = round((time.perf_counter() - t_retrieve) * 1000, 1)
 
-    t_context = time.perf_counter()
-    context = format_context(retrieved, query)
-    timings["context_format"] = round((time.perf_counter() - t_context) * 1000, 1)
-
     # ── Pre-LLM relevance gate ────────────────────────────────
     # If retrieved context is clearly irrelevant, skip the LLM entirely
     # and return "Not found" — saves ~80s of LLM time and prevents hallucination.
@@ -573,31 +638,22 @@ async def answer_question(
 
     # Rebuild the prompt through the size guard (shrinks + rebuilds once if
     # it exceeds the char ceiling) so we never depend on Ollama truncation.
-    context, user_message = _build_prompt_with_guard(retrieved, query)
+    t_context = time.perf_counter()
+    context, user_message, ctx_stats = _build_prompt_with_guard(retrieved, query)
+    timings["context_format"] = round((time.perf_counter() - t_context) * 1000, 1)
 
+    model = _select_model(query)
     client = ollama.Client(host=settings.ollama_host)
     t_llm = time.perf_counter()
-    response = client.chat(
-        model=settings.chatbot_llm_model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        options={
-            "num_predict": settings.chatbot_max_tokens,
-            "temperature": 0.1,
-            "num_ctx": settings.chatbot_llm_num_ctx,
-            "num_thread": 8,
-            "repeat_penalty": 1.1,
-        },
-        keep_alive=-1,
-    )
+    response = client.chat(**_chat_request(user_message, model))
     timings["llm_generation"] = round((time.perf_counter() - t_llm) * 1000, 1)
 
     _log_llm_metrics(
         response,
+        model=model,
         prompt_chars=len(user_message),
         retrieval_ms=timings.get("retrieval", 0.0),
+        stats=ctx_stats,
     )
 
     answer_text = response["message"]["content"]
@@ -694,13 +750,7 @@ def generate_response_stream(
     retrieve_ms = (time.perf_counter() - t_retrieve) * 1000
     timings["retrieval"] = round(retrieve_ms, 1)
 
-    # ── Step 2: Format context ───────────────────────────────
     yield f"data: {json.dumps({'type': 'step', 'step': 'searching', 'message': f'Searching relevant email conversations... ({retrieve_ms:.0f}ms)'})}\n\n"
-
-    t_context = time.perf_counter()
-    context = format_context(retrieved, query)
-    context_ms = (time.perf_counter() - t_context) * 1000
-    timings["context_format"] = round(context_ms, 1)
 
     # ── Send sources + retrieval timings immediately ─────────
     sources = _get_sources(retrieved)
@@ -745,12 +795,14 @@ def generate_response_stream(
         return
 
     # ── Step 3: Stream LLM generation ────────────────────────
-    model = settings.chatbot_llm_model
+    model = _select_model(query)
     yield f"data: {json.dumps({'type': 'step', 'step': 'generating', 'message': f'Sending to LLM ({model})...'})}\n\n"
 
-    # Rebuild the prompt through the size guard (shrinks + rebuilds once if it
+    # Build the prompt through the size guard (shrinks + rebuilds once if it
     # exceeds the char ceiling) so we never depend on Ollama truncation.
-    context, user_message = _build_prompt_with_guard(retrieved, query)
+    t_context = time.perf_counter()
+    context, user_message, ctx_stats = _build_prompt_with_guard(retrieved, query)
+    timings["context_format"] = round((time.perf_counter() - t_context) * 1000, 1)
 
     prompt_tokens = len(user_message) // 4
     logger.info(
@@ -758,6 +810,7 @@ def generate_response_stream(
         model, prompt_tokens, settings.chatbot_max_tokens,
     )
 
+    request = _chat_request(user_message, model)
     client = ollama.Client(host=settings.ollama_host)
     t_llm = time.perf_counter()
     t_first_token = None
@@ -781,22 +834,7 @@ def generate_response_stream(
         """Run blocking Ollama streaming in a background thread,
         pushing each token (or error/sentinel) into token_queue."""
         try:
-            stream = client.chat(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message},
-                ],
-                options={
-                    "num_predict": settings.chatbot_max_tokens,
-                    "temperature": 0.1,
-                    "num_ctx": settings.chatbot_llm_num_ctx,
-                    "num_thread": 8,
-                    "repeat_penalty": 1.1,
-                },
-                keep_alive=-1,
-                stream=True,
-            )
+            stream = client.chat(**request, stream=True)
             for chunk in stream:
                 token = chunk["message"]["content"]
                 if token:
@@ -881,25 +919,32 @@ def generate_response_stream(
     )
 
     # ── Per-request LLM metrics (from Ollama's terminal chunk) ──
+    first_token_s = (t_first_token - t_llm) if t_first_token else None
     if llm_final:
         _log_llm_metrics(
             llm_final[0],
+            model=model,
             prompt_chars=len(user_message),
             retrieval_ms=timings.get("retrieval", 0.0),
+            stats=ctx_stats,
+            first_token_s=first_token_s,
         )
     else:
         # No terminal chunk captured — fall back to our own token count so the
         # metrics line is still emitted (prompt tokens estimated as chars/4).
         logger.info(
-            "LLM metrics: prompt_chars=%d prompt_eval_count=%d (est) eval_count=%d "
+            "LLM metrics: model=%s threads=%d/%d context_chars=%d prompt_chars=%d "
+            "prompt_tokens=%d (est) first_token=%.2fs eval_count=%d "
             "eval_duration=%.2fs tokens_per_sec=%.1f retrieval=%.1fms",
-            len(user_message), len(user_message) // 4, token_count,
+            model, ctx_stats.get("threads_used", 0), ctx_stats.get("threads_in", 0),
+            ctx_stats.get("context_chars", 0), len(user_message),
+            len(user_message) // 4, first_token_s or 0.0, token_count,
             llm_ms / 1000, tokens_per_sec, timings.get("retrieval", 0.0),
         )
-        if (len(user_message) // 4) > PROMPT_EVAL_WARN_TOKENS:
+        if (len(user_message) // 4) > settings.chatbot_prompt_warn_tokens:
             logger.warning(
                 "estimated prompt tokens %d exceed %d - reduce CHATBOT_CONTEXT_MAX_CHARS",
-                len(user_message) // 4, PROMPT_EVAL_WARN_TOKENS,
+                len(user_message) // 4, settings.chatbot_prompt_warn_tokens,
             )
 
     _persist_message(query, full_response)
