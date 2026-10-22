@@ -1,0 +1,34 @@
+{
+  "value": [
+    {
+      "id": "msg-001",
+      "subject": "RE: Q1 Retail Performance Numbers",
+      "from": { "emailAddress": { "name": "Priya Sharma", "address": "priya.sharma@rblbank.com" } },
+      "toRecipients": [
+        { "emailAddress": { "name": "Deepak Kumar", "address": "deepak.kumar@rblbank.com" } }
+      ],
+      "receivedDateTime": "2026-08-28T06:12:00Z",
+      "hasAttachments": false,
+      "body": {
+        "contentType": "text",
+        "content": "Hi Deepak, sharing the Q1 retail numbers ahead of tomorrow's review. NPA ratio improved by 0.3pp QoQ. Please review before the call and let me know if you need the branch-wise breakup. Action: Finance team to send the reconciled branch-wise breakup by Friday."
+      },
+      "isRead": true
+    },
+    {
+      "id": "msg-002",
+      "subject": "RE: Q1 Retail Performance Numbers",
+      "from": { "emailAddress": { "name": "Deepak Kumar", "address": "deepak.kumar@rblbank.com" } },
+      "toRecipients": [
+        { "emailAddress": { "name": "Priya Sharma", "address": "priya.sharma@rblbank.com" } }
+      ],
+      "receivedDateTime": "2026-08-28T07:45:00Z",
+      "hasAttachments": true,
+      "body": {
+        "contentType": "text",
+        "content": "Thanks Priya. Please also pull in the scanned branch audit report (attached) into the discussion, and flag any overdue compliance items to Risk before Monday."
+      },
+      "isRead": true
+    }
+  ]
+}

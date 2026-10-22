@@ -1,0 +1,91 @@
+# ---------------------------------------------------------------------------
+# Backend dependencies for the RBL Bank Digital Office multi-agent system.
+# Versions are pinned exactly (no open ranges) for reproducible installs.
+# ---------------------------------------------------------------------------
+ 
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+ 
+# Config / settings management (centralised env loading)
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+ 
+# Microsoft Graph API auth + HTTP
+msal==1.31.0
+requests==2.32.3
+httpx==0.27.2
+ 
+# LangGraph / LangChain + local Ollama models
+langgraph==0.2.34
+langchain-core==0.3.15
+langchain-ollama==0.2.0
+# Full `langchain` package is required by langfuse's CallbackHandler
+# integration (core/observability.py), even though agents themselves
+# only depend on langchain-core/langgraph.
+langchain==0.3.7
+ 
+# PDF -> page images for the vision OCR pipeline (email agent attachments)
+pypdfium2==4.30.0
+Pillow==10.4.0
+ 
+# Direct (non-vision) attachment text extraction (email agent):
+# born-digital PDFs via PyMuPDF, Excel workbooks via openpyxl,
+# PowerPoint decks via python-pptx, Word documents via python-docx
+PyMuPDF==1.24.11
+openpyxl==3.1.5
+python-pptx==1.0.2
+python-docx==1.1.2
+ 
+# Observability (togglable)
+langfuse==2.53.9
+ 
+# RAG chatbot (Weaviate hybrid vector search + BM25 keyword search)
+numpy==1.26.4
+beautifulsoup4==4.12.3
+ollama==0.3.3
+rank-bm25==0.2.2
+ 
+# PostgreSQL async driver
+asyncpg==0.30.0
+
+# Async file I/O (OneDrive document downloads)
+aiofiles==24.1.0
+# AWS SDK — PostgreSQL credentials + Graph OAuth refresh token are sourced
+# from AWS Secrets Manager (secret: rbl-digitalofficeofceo-prod-parameterstore,
+# region: ap-south-1) using the EC2 instance IAM role credential chain.
+# See core/secrets_manager.py. No AWS credentials are hardcoded.
+boto3==1.35.36
+botocore==1.35.36
+
+# PostgreSQL async driver
+asyncpg==0.30.0
+ 
+# Redis client (meeting<->cluster direct-match result caching + locking)
+redis==5.0.8
+ 
+# Weaviate client (primary vector retrieval for meeting<->cluster matching)
+weaviate-client==4.11.0
+ 
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+
+# Document Q&A module (MIS PDF chatbot)
+sqlite-vec==0.1.6
+PyYAML==6.0.2
+pandas==2.2.3
+pdfplumber==0.11.4
+
+# OCR for table extraction from embedded images in PDFs (docTR + PyTorch)
+python-doctr[torch]==0.8.1
+
+# TEMPORARY: local FAISS backend for the email agent, selected by
+# VECTOR_STORE_BACKEND=faiss (see core/faiss/). Remove this line when the
+# FAISS toggle is removed.
+faiss-cpu==1.9.0
+ 
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0

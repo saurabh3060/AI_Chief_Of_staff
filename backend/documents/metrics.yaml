@@ -1,0 +1,43 @@
+# Canonical metrics. A table row/column label or chart series whose name (units in brackets
+# removed, case and punctuation ignored) equals the name or a synonym maps to the metric id.
+# Unmatched labels still become facts under their own label and are listed in the Review tab,
+# so add a synonym here when the same metric shows up under a new name.
+#
+# kind: amount | count | percent | ratio | bps  (percent/bps changes are reported in bps/pp)
+# range: plausible [min, max] for a value in the metric's usual unit; outside it = flagged.
+
+# ---- Bank level: balance sheet and P&L ----
+- {id: advances, name: Net advances, kind: amount, synonyms: [advances, gross advances, loans and advances, loan book, net advances]}
+- {id: deposits, name: Total deposits, kind: amount, synonyms: [deposits, total deposits]}
+- {id: casa_ratio, name: CASA ratio, kind: percent, range: [0, 100], synonyms: [casa, casa ratio, casa %, casa share]}
+- {id: nii, name: Net interest income, kind: amount, synonyms: [nii, net interest income]}
+- {id: nim, name: Net interest margin, kind: percent, range: [0, 15], synonyms: [nim, net interest margin]}
+- {id: other_income, name: Other income, kind: amount, synonyms: [other income, non interest income, fee income, core fee income]}
+- {id: opex, name: Operating expenses, kind: amount, synonyms: [opex, operating expenses, operating cost, total opex]}
+- {id: cost_to_income, name: Cost to income ratio, kind: percent, range: [0, 150], synonyms: [cost to income, cost income ratio, c/i ratio, cost/income]}
+- {id: operating_profit, name: Operating profit, kind: amount, synonyms: [operating profit, core operating profit, pre provision operating profit, ppop]}
+- {id: provisions, name: Provisions, kind: amount, synonyms: [provisions, provisions and contingencies, total provisions]}
+- {id: credit_cost, name: Credit cost, kind: percent, range: [-5, 20], synonyms: [credit cost, credit cost annualised, coc, cost of credit]}
+- {id: pat, name: Net profit, kind: amount, synonyms: [pat, net profit, profit after tax, net profit after tax]}
+- {id: roa, name: Return on assets, kind: percent, range: [-10, 10], synonyms: [roa, return on assets, roa annualised]}
+- {id: roe, name: Return on equity, kind: percent, range: [-50, 50], synonyms: [roe, return on equity, roe annualised]}
+- {id: gnpa_pct, name: Gross NPA %, kind: percent, range: [0, 30], synonyms: [gnpa, gnpa %, gross npa, gross npa %, gnpa ratio]}
+- {id: nnpa_pct, name: Net NPA %, kind: percent, range: [0, 20], synonyms: [nnpa, nnpa %, net npa, net npa %, nnpa ratio]}
+- {id: pcr, name: Provision coverage ratio, kind: percent, range: [0, 100], synonyms: [pcr, provision coverage, provision coverage ratio, pcr incl technical write off]}
+- {id: crar, name: Capital adequacy ratio, kind: percent, range: [0, 40], synonyms: [crar, car, capital adequacy, capital adequacy ratio, total capital ratio]}
+- {id: cet1, name: CET1 ratio, kind: percent, range: [0, 40], synonyms: [cet1, cet 1, cet1 ratio, common equity tier 1]}
+- {id: lcr, name: Liquidity coverage ratio, kind: percent, range: [0, 500], synonyms: [lcr, liquidity coverage ratio]}
+- {id: slippages, name: Gross slippages, kind: amount, synonyms: [slippages, gross slippages, fresh slippages]}
+- {id: write_off, name: Write-off, kind: amount, synonyms: [write off, write offs, write-off, technical write off]}
+
+# ---- Credit cards business ----
+- {id: cc_sourcing_total, name: Card sourcing (total), kind: count, synonyms: [sourcing total, total sourcing, cards sourced, new cards issued]}
+- {id: cc_cif, name: Cards in force (CIF), kind: count, synonyms: [cif, cards in force]}
+- {id: cc_cif_net_addition, name: CIF net addition, kind: count, synonyms: [net addition, cif net addition, net additions]}
+- {id: cc_spends, name: Card spends, kind: amount, synonyms: [spends, spend, card spends, total spends, spends cr]}
+- {id: cc_active_rate, name: Active rate, kind: percent, range: [0, 100], synonyms: [active rate, activation rate, active %]}
+- {id: cc_spend_per_card, name: Spend per card, kind: amount, synonyms: [spend/card, spend per card, spends/card]}
+- {id: cc_spend_per_card_day, name: Spend per card per day, kind: amount, synonyms: [spends/card/day, spend/card/day, spend per card per day]}
+- {id: cc_enr, name: ENR (card receivables), kind: amount, synonyms: [enr, card receivables, receivables, closing book]}
+- {id: cc_enr_term_share, name: ENR term share, kind: percent, range: [0, 100], synonyms: [term, term %, enr term]}
+- {id: cc_enr_nonterm_share, name: ENR non-term share, kind: percent, range: [0, 100], synonyms: [non-term, non term, non-term %, enr non-term]}
