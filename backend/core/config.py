@@ -1271,6 +1271,25 @@ class Settings(BaseSettings):
         validation_alias="EMAIL_PIPELINE_EMBEDDING_CACHE_TTL_SECONDS",
     )
 
+    # ---- Email pipeline Ollama runtime options (pipeline-only, opt-in) ----
+    # Applied to every call made through OllamaClient and to the pipeline's
+    # embedding calls - NOT to the chatbot, which has its own CHATBOT_* values
+    # and is never read or changed here. Each one defaults to "not sent", so the
+    # behaviour is exactly what it was until a value is set.
+    #   EMAIL_PIPELINE_OLLAMA_KEEP_ALIVE  e.g. "30m" or "-1": keep the model loaded
+    #                                     between calls ("" = Ollama's default).
+    #   EMAIL_PIPELINE_OLLAMA_NUM_THREAD  CPU threads (0 = Ollama's default).
+    email_pipeline_ollama_keep_alive: str = Field(
+        default="",
+        alias="EMAIL_PIPELINE_OLLAMA_KEEP_ALIVE",
+        validation_alias="EMAIL_PIPELINE_OLLAMA_KEEP_ALIVE",
+    )
+    email_pipeline_ollama_num_thread: int = Field(
+        default=0,
+        alias="EMAIL_PIPELINE_OLLAMA_NUM_THREAD",
+        validation_alias="EMAIL_PIPELINE_OLLAMA_NUM_THREAD",
+    )
+
     # ---- Retry / backoff ----
     retry_max_attempts: int = 3
     retry_base_delay_seconds: float = 1.0

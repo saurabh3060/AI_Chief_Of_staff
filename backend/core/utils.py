@@ -49,3 +49,12 @@ def sanitize_log_entry(entry: dict[str, Any]) -> dict[str, Any]:
         else:
             sanitized[key] = value
     return sanitized
+
+
+def parse_ollama_keep_alive(value: str) -> "int | str":
+    """Convert a keep_alive setting for Ollama: a plain integer (seconds, ``-1`` =
+    forever) becomes an int, anything else (e.g. ``"30m"``) is passed through."""
+    try:
+        return int(value)
+    except ValueError:
+        return value

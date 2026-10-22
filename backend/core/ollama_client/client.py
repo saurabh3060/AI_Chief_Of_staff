@@ -37,6 +37,7 @@ from core.config import Settings, get_settings
 from core.exceptions import OllamaError
 from core.logging_config import get_agent_logger
 from core.retry import with_retry
+from core.utils import parse_ollama_keep_alive
 
 logger = get_agent_logger("ollama_client")
 
@@ -142,6 +143,14 @@ class OllamaClient:
         }
         if num_predict is not None and num_predict > 0:
             kwargs["num_predict"] = num_predict
+        # Opt-in runtime options (EMAIL_PIPELINE_OLLAMA_*): only sent when set, so the
+        # default request is exactly what it was before. They change speed, not content.
+        keep_alive = (getattr(self._settings, "email_pipeline_ollama_keep_alive", "") or "").strip()
+        if keep_alive:
+            kwargs["keep_alive"] = parse_ollama_keep_alive(keep_alive)
+        num_thread = int(getattr(self._settings, "email_pipeline_ollama_num_thread", 0) or 0)
+        if num_thread > 0:
+            kwargs["num_thread"] = num_thread
         return ChatOllama(**kwargs)
 
     @staticmethod

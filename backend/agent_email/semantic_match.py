@@ -21,6 +21,7 @@ import ollama
 
 from agent_email import pipeline_cache
 from core.config import Settings, get_settings
+from core.utils import parse_ollama_keep_alive
 
 # A dedicated, owned Ollama client for embeddings.
 #
@@ -89,7 +90,18 @@ def _embed_sync(text: str, num_ctx: int, model: str) -> np.ndarray:
     """Blocking call to Ollama's embedding endpoint for one text."""
     # Use our OWN client (closed on shutdown) rather than the ollama module's
     # shared default client, so embedding sockets to :11434 don't leak.
-    response = _get_embed_client().embed(model=model, input=text, options={"num_ctx": num_ctx})
+    settings = get_settings()
+    options = {"num_ctx": num_ctx}
+    # Opt-in runtime options (EMAIL_PIPELINE_OLLAMA_*): only sent when set, so the default
+    # request is unchanged. They change speed, not the vector.
+    num_thread = int(getattr(settings, "email_pipeline_ollama_num_thread", 0) or 0)
+    if num_thread > 0:
+        options["num_thread"] = num_thread
+    extra = {}
+    keep_alive = (getattr(settings, "email_pipeline_ollama_keep_alive", "") or "").strip()
+    if keep_alive:
+        extra["keep_alive"] = parse_ollama_keep_alive(keep_alive)
+    response = _get_embed_client().embed(model=model, input=text, options=options, **extra)
     return np.array(response["embeddings"][0], dtype=np.float32)
 
 
