@@ -45,6 +45,7 @@ from agent_email.clustering import (
     split_for_synthesis,
     tag_candidates_with_topics,
 )
+from agent_email import pipeline_cache
 from agent_email.pipeline_cache import chat_with_cache
 from agent_email.pipeline_metrics import PipelineMetricsCollector
 from agent_email.ocr import parse_attachment
@@ -849,9 +850,12 @@ async def run_email_cluster_pipeline(
 
     await tag_candidates_with_topics(candidates, settings=active_settings, run_id=run_id)
 
+    embedding_hits_before = pipeline_cache.embedding_cache_hits()
     vectors = await embed_candidates(candidates, settings=active_settings)
     logger.info("[CLUSTER-EMBED run=%s] embedded %d candidate(s)", run_id, len(vectors))
-    PipelineMetricsCollector.record_embedding(len(vectors), 0)
+    PipelineMetricsCollector.record_embedding(
+        len(vectors), 0, pipeline_cache.embedding_cache_hits() - embedding_hits_before,
+    )
 
     # Meeting-anchored clustering: pull past occurrences (once/throttled),
     # then map each candidate to the meeting occurrence it belongs to so a

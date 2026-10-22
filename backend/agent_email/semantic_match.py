@@ -19,6 +19,7 @@ import threading
 import numpy as np
 import ollama
 
+from agent_email import pipeline_cache
 from core.config import Settings, get_settings
 
 # A dedicated, owned Ollama client for embeddings.
@@ -111,12 +112,26 @@ async def embed_text(text: str, settings: Settings | None = None) -> np.ndarray:
         return np.zeros(384, dtype=np.float32)
     
     model = _resolve_embedding_model(active)
+
+    # Exact-match cache (pipeline-only Redis keys): the same model + context size +
+    # text always embeds to the same vector, so an already-computed one is reused.
+    cache_key = pipeline_cache.embedding_cache_key(
+        active, model=model, num_ctx=active.ollama_num_ctx, text=text,
+    )
+    if cache_key is not None:
+        cached = await pipeline_cache.embedding_get(active, cache_key)
+        if cached is not None:
+            return cached
+
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _embed_sync, text, active.ollama_num_ctx, model)
     
     # Record embedding call
     from agent_email.pipeline_metrics import PipelineMetricsCollector
     PipelineMetricsCollector.record_llm_call("embedding", tokens_in=len(text.split()))
+
+    if cache_key is not None:
+        await pipeline_cache.embedding_set(active, cache_key, result)
     
     return result
 

@@ -25,8 +25,11 @@ Safety properties (each one is relied on by the callers):
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+
+import numpy as np
 
 from core.config import Settings, get_settings
 from core.logging_config import get_agent_logger
@@ -37,14 +40,21 @@ logger = get_agent_logger("agent_email")
 # Bump to invalidate every entry if the key/value layout ever changes.
 _KEY_VERSION = "v1"
 _LLM_NAMESPACE = "llmcache:"
+_EMBEDDING_NAMESPACE = "embcache:"
 
 _llm_cache_hits = 0
+_embedding_cache_hits = 0
 _prefix_warning_logged = False
 
 
 def llm_cache_hits() -> int:
     """LLM replies served from the cache so far in this process."""
     return _llm_cache_hits
+
+
+def embedding_cache_hits() -> int:
+    """Embeddings served from the cache so far in this process."""
+    return _embedding_cache_hits
 
 
 def _base_prefix(settings: Settings) -> str | None:
@@ -177,3 +187,60 @@ async def chat_with_cache(
             return cached, LlmCacheTicket(key, hit=True)
     reply = await client.chat(prompt, system_prompt=system_prompt, num_predict=num_predict)
     return reply, LlmCacheTicket(key, hit=False)
+
+
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
+
+def embedding_cache_key(settings: Settings, *, model: str, num_ctx: int, text: str) -> str | None:
+    """Exact-match key for one embedding: the model, the context size sent with
+    the request, and the exact text. ``None`` when caching is off."""
+    prefix = _base_prefix(settings)
+    if prefix is None:
+        return None
+    payload = json.dumps(
+        {"v": _KEY_VERSION, "model": model, "num_ctx": num_ctx, "text": text},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return f"{prefix}{_EMBEDDING_NAMESPACE}{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+async def embedding_get(settings: Settings, key: str) -> np.ndarray | None:
+    """The cached vector (bit-identical float32), or ``None`` on a miss / any problem."""
+    global _embedding_cache_hits
+    client = await get_redis(settings)
+    if client is None:
+        return None
+    try:
+        raw = await client.get(key)
+        if raw is None:
+            return None
+        value = json.loads(raw)
+        vec = np.frombuffer(base64.b64decode(value["v"]), dtype=np.float32).copy()
+        if vec.size == 0 or vec.size != int(value["d"]):
+            return None
+    except Exception as exc:  # noqa: BLE001 - any cache problem is a miss
+        logger.warning("[PIPELINE-CACHE] embedding GET failed (treating as miss): %s", exc)
+        return None
+    _embedding_cache_hits += 1
+    return vec
+
+
+async def embedding_set(settings: Settings, key: str, vec: np.ndarray) -> None:
+    """Store a vector as its raw float32 bytes so a hit returns exactly what was computed."""
+    client = await get_redis(settings)
+    if client is None:
+        return
+    arr = np.asarray(vec, dtype=np.float32)
+    if arr.ndim != 1 or arr.size == 0:
+        return
+    ttl = int(getattr(settings, "email_pipeline_embedding_cache_ttl_seconds", 0) or 0)
+    payload = json.dumps({"d": int(arr.size), "v": base64.b64encode(arr.tobytes()).decode("ascii")})
+    try:
+        if ttl > 0:
+            await client.set(key, payload, ex=ttl)
+        else:
+            await client.set(key, payload)
+    except Exception as exc:  # noqa: BLE001 - the cache must never break a pipeline run
+        logger.warning("[PIPELINE-CACHE] embedding SET failed (not cached): %s", exc)

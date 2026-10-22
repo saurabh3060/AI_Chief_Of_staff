@@ -249,3 +249,103 @@ def test_garbage_in_the_cache_is_a_miss(redis):
     redis.data[key] = "not json"
     reply, ticket = _chat(client, s)
     assert reply == "real" and not ticket.hit
+
+
+# ── embeddings ────────────────────────────────────────────────
+
+import numpy as np  # noqa: E402
+
+
+def _emb_settings(**over):
+    return _settings(
+        bu_email_pipeline_enabled=True, embedding_model="nomic-embed-text", ollama_num_ctx=8192,
+        email_pipeline_embedding_cache_ttl_seconds=900, **over,
+    )
+
+
+def test_embedding_key_depends_on_model_context_and_exact_text():
+    s = _emb_settings()
+    key = pipeline_cache.embedding_cache_key(s, model="m", num_ctx=1, text="hello")
+    assert key == pipeline_cache.embedding_cache_key(s, model="m", num_ctx=1, text="hello")
+    others = [
+        pipeline_cache.embedding_cache_key(s, model="m2", num_ctx=1, text="hello"),
+        pipeline_cache.embedding_cache_key(s, model="m", num_ctx=2, text="hello"),
+        pipeline_cache.embedding_cache_key(s, model="m", num_ctx=1, text="hello "),
+    ]
+    assert key not in others and len(set(others)) == 3 and key.startswith("emailagent:embcache:")
+    off = _emb_settings(email_pipeline_cache_enabled=False)
+    assert pipeline_cache.embedding_cache_key(off, model="m", num_ctx=1, text="hello") is None
+
+
+def test_cached_vector_is_bit_identical_to_the_computed_one(redis):
+    s = _emb_settings()
+    vec = np.random.default_rng(7).standard_normal(768).astype(np.float32)
+    key = pipeline_cache.embedding_cache_key(s, model="m", num_ctx=1, text="t")
+    asyncio.run(pipeline_cache.embedding_set(s, key, vec))
+    got = asyncio.run(pipeline_cache.embedding_get(s, key))
+    assert got.dtype == np.float32 and got.tobytes() == vec.tobytes()
+    assert redis.ttls[key] == 900
+
+
+def test_embedding_cache_misses_on_corrupt_or_wrong_size_values(redis):
+    s = _emb_settings()
+    key = pipeline_cache.embedding_cache_key(s, model="m", num_ctx=1, text="t")
+    for bad in ("nope", '{"d": 3, "v": "AAAA"}', '{"d": 0, "v": ""}'):
+        redis.data[key] = bad
+        assert asyncio.run(pipeline_cache.embedding_get(s, key)) is None
+
+
+@pytest.fixture
+def embed_calls(monkeypatch):
+    """Replace the real Ollama embedding call with a deterministic counting fake."""
+    from agent_email import semantic_match
+
+    calls = []
+
+    def fake_embed_sync(text, num_ctx, model):
+        calls.append(text)
+        return np.array([len(text), sum(map(ord, text)) % 97, 1.0], dtype=np.float32)
+
+    monkeypatch.setattr(semantic_match, "_embed_sync", fake_embed_sync)
+    return calls
+
+
+def test_embed_text_reuses_a_stored_vector(redis, embed_calls):
+    from agent_email import semantic_match
+
+    s = _emb_settings()
+    first = asyncio.run(semantic_match.embed_text("quarterly plan", s))
+    second = asyncio.run(semantic_match.embed_text("quarterly plan", s))
+    other = asyncio.run(semantic_match.embed_text("another text", s))
+    assert embed_calls == ["quarterly plan", "another text"]          # the repeat made no model call
+    assert first.tobytes() == second.tobytes() and not np.array_equal(first, other)
+
+
+def test_embed_text_without_the_cache_calls_the_model_every_time(redis, embed_calls):
+    from agent_email import semantic_match
+
+    s = _emb_settings(email_pipeline_cache_enabled=False)
+    asyncio.run(semantic_match.embed_text("x", s))
+    asyncio.run(semantic_match.embed_text("x", s))
+    assert embed_calls == ["x", "x"] and redis.data == {}
+
+
+def test_department_index_is_rebuilt_from_cached_seed_vectors_after_a_restart(redis, embed_calls):
+    """A new process (empty in-memory index) re-embeds nothing and gets identical vectors."""
+    from agent_email import dept_centroids
+
+    depts = [SimpleNamespace(name="Alpha", summary="alpha summary"), SimpleNamespace(name="Beta", summary="")]
+    s = _emb_settings(bu_departments=depts, department_tagging_example_phrases={"Alpha": ["a1", "a2"]})
+
+    dept_centroids._index_cache.clear()
+    first = asyncio.run(dept_centroids.build_department_index(s))
+    seeds_embedded = len(embed_calls)
+    assert seeds_embedded == 4                                       # alpha summary + a1 + a2, then Beta's name
+
+    dept_centroids._index_cache.clear()                              # simulate a fresh process
+    second = asyncio.run(dept_centroids.build_department_index(s))
+    assert len(embed_calls) == seeds_embedded                        # nothing re-embedded
+    for name in ("Alpha", "Beta"):
+        assert first["centroids"][name].tobytes() == second["centroids"][name].tobytes()
+        assert first["prototypes"][name].tobytes() == second["prototypes"][name].tobytes()
+    dept_centroids._index_cache.clear()
