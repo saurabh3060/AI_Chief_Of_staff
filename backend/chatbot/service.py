@@ -13,9 +13,12 @@ Ported from the standalone chatbot_final project's chatbot.py, adapted to:
     the module-level chatbot state)
 """
 
+import ast
 import asyncio
 import hashlib
 import json
+import math
+import operator
 import queue
 import re
 import threading
@@ -45,52 +48,71 @@ def _resolve_prompt_path(raw: str) -> Path:
 
 
 _prompt_cache: dict = {"path": None, "mtime": None, "text": ""}
+_calc_prompt_cache: dict = {"path": None, "mtime": None, "text": ""}
 
 
-def get_system_prompt() -> str:
-    """Return the chatbot system prompt from CHATBOT_SYSTEM_PROMPT_PATH.
+def _read_prompt_file(raw_path: str, cache: dict, label: str) -> str:
+    """Return the text of a prompt file, re-reading it when its mtime changes.
 
-    Re-reads the file when its mtime changes. Raises RuntimeError when the file
-    is missing or empty so a bad deployment fails loudly instead of silently
-    answering with a different prompt. Logs path, size and a short hash on each
-    (re)load so the prompt a running server actually uses can be confirmed.
+    Raises RuntimeError when the file is missing or empty so a bad deployment
+    fails loudly instead of silently answering with a different prompt. Logs
+    path, size and a short hash on each (re)load so the prompt a running server
+    actually uses can be confirmed.
     """
-    path = _resolve_prompt_path(get_settings().chatbot_system_prompt_path)
+    path = _resolve_prompt_path(raw_path)
     try:
         mtime = path.stat().st_mtime
     except OSError as e:
-        raise RuntimeError(f"Chatbot system prompt file not readable: {path} ({e})") from e
+        raise RuntimeError(f"{label} file not readable: {path} ({e})") from e
 
-    if _prompt_cache["path"] == path and _prompt_cache["mtime"] == mtime:
-        return _prompt_cache["text"]
+    if cache["path"] == path and cache["mtime"] == mtime:
+        return cache["text"]
 
     text = path.read_text(encoding="utf-8").strip()
     if not text:
-        raise RuntimeError(f"Chatbot system prompt file is empty: {path}")
+        raise RuntimeError(f"{label} file is empty: {path}")
 
-    _prompt_cache.update(path=path, mtime=mtime, text=text)
+    cache.update(path=path, mtime=mtime, text=text)
     logger.info(
-        "Chatbot system prompt loaded: path=%s chars=%d sha256=%s",
-        path, len(text), hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
+        "%s loaded: path=%s chars=%d sha256=%s",
+        label, path, len(text), hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
     )
     return text
 
 
-def _chat_request(user_message: str, model: str) -> dict:
+def get_system_prompt() -> str:
+    """Return the chatbot system prompt from CHATBOT_SYSTEM_PROMPT_PATH."""
+    return _read_prompt_file(get_settings().chatbot_system_prompt_path, _prompt_cache, "Chatbot system prompt")
+
+
+def get_calc_prompt() -> str:
+    """Return the instruction for the calculation call from CHATBOT_CALC_PROMPT_PATH."""
+    return _read_prompt_file(get_settings().chatbot_calc_prompt_path, _calc_prompt_cache, "Chatbot calc prompt")
+
+
+def _chat_request(
+    user_message: str,
+    model: str,
+    *,
+    system_prompt: str | None = None,
+    num_predict: int | None = None,
+    temperature: float | None = None,
+) -> dict:
     """Keyword arguments for ``ollama.Client.chat`` - the single place that
-    decides messages, options and keep_alive for both the streaming and
-    non-streaming paths (``model`` comes from ``_select_model``). Every value
-    comes from Settings / the prompt file."""
+    decides messages, options and keep_alive for the streaming, non-streaming
+    and calculation calls (``model`` comes from ``_select_model``). Every value
+    comes from Settings / the prompt files; the three keyword arguments let the
+    calculation call override the system prompt, token cap and temperature."""
     settings = get_settings()
     return {
         "model": model,
         "messages": [
-            {"role": "system", "content": get_system_prompt()},
+            {"role": "system", "content": get_system_prompt() if system_prompt is None else system_prompt},
             {"role": "user", "content": user_message},
         ],
         "options": {
-            "num_predict": settings.chatbot_max_tokens,
-            "temperature": settings.chatbot_temperature,
+            "num_predict": settings.chatbot_max_tokens if num_predict is None else num_predict,
+            "temperature": settings.chatbot_temperature if temperature is None else temperature,
             "repeat_penalty": settings.chatbot_repeat_penalty,
             "num_ctx": settings.chatbot_llm_num_ctx,
             "num_thread": settings.chatbot_num_thread,
@@ -107,27 +129,37 @@ GREETING_RESPONSE = (
 
 NOT_FOUND_RESPONSE = "Not found in the provided emails."
 
-def _wants_number(query: str) -> bool:
-    """True when the question asks for a figure (CHATBOT_NUMERIC_QUESTION_PATTERN)."""
-    pattern = get_settings().chatbot_numeric_question_pattern
+def _matches_pattern(pattern: str, setting_name: str, query: str) -> bool:
+    """Case-insensitive regex match of a question; an invalid pattern logs a
+    WARNING and counts as no match."""
     try:
         return re.search(pattern, query, re.IGNORECASE) is not None
     except re.error as e:
-        logger.warning("Invalid CHATBOT_NUMERIC_QUESTION_PATTERN %r: %s", pattern, e)
+        logger.warning("Invalid %s %r: %s", setting_name, pattern, e)
         return False
+
+
+def _wants_number(query: str) -> bool:
+    """True when the question asks for a figure (CHATBOT_NUMERIC_QUESTION_PATTERN)."""
+    return _matches_pattern(get_settings().chatbot_numeric_question_pattern, "CHATBOT_NUMERIC_QUESTION_PATTERN", query)
+
+
+def _wants_calc(query: str) -> bool:
+    """True when the question asks for a calculation (CHATBOT_CALC_QUESTION_PATTERN)."""
+    return _matches_pattern(get_settings().chatbot_calc_question_pattern, "CHATBOT_CALC_QUESTION_PATTERN", query)
 
 
 def _select_model(query: str) -> str:
     """Pick the chat model for this question.
 
     CHATBOT_MODEL_ROUTING off (default): always CHATBOT_LLM_MODEL, as before.
-    On: the accurate model for questions that ask for a number, the fast model
-    for everything else.
+    On: the accurate model for questions that ask for a number or a calculation,
+    the fast model for everything else.
     """
     settings = get_settings()
     if not settings.chatbot_model_routing:
         return settings.chatbot_llm_model
-    if _wants_number(query):
+    if _wants_number(query) or _wants_calc(query):
         return settings.chatbot_llm_model_accurate
     return settings.chatbot_llm_model_fast
 
@@ -141,15 +173,128 @@ def _build_user_message(context: str, query: str) -> str:
     )
 
 
+# ── Arithmetic in code (CHATBOT_CALC_IN_CODE) ─────────────────
+# The small model is unreliable at arithmetic and unit conversion. When the
+# switch is on, a short extra call asks the accurate model for ONE arithmetic
+# expression, Python evaluates it safely, and the result is appended to the
+# prompt. Spec: temperature 0 for that call.
+_CALC_TEMPERATURE = 0.0
+_CALC_BINARY_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.Pow: operator.pow,
+}
+_CALC_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def _safe_eval(expression: str) -> float:
+    """Evaluate an arithmetic expression without eval/exec.
+
+    Only numbers, + - * / **, a leading sign and parentheses are allowed; any
+    other syntax raises ValueError. Every number is handled as a float, so a
+    huge power overflows (OverflowError) instead of building an enormous
+    integer. The result must be a finite real number.
+    """
+    def ev(node) -> float:
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return float(node.value)
+        if isinstance(node, ast.BinOp) and type(node.op) in _CALC_BINARY_OPS:
+            return _CALC_BINARY_OPS[type(node.op)](ev(node.left), ev(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _CALC_UNARY_OPS:
+            return _CALC_UNARY_OPS[type(node.op)](ev(node.operand))
+        raise ValueError(f"not allowed in a calculation: {type(node).__name__}")
+
+    value = ev(ast.parse(expression.strip(), mode="eval"))
+    if not isinstance(value, float) or not math.isfinite(value):
+        raise ValueError("result is not a finite real number")
+    return value
+
+
+def _clean_expression(raw: str) -> str:
+    """First line of the model reply, without code fences or thousands
+    separators (a comma between two digits)."""
+    text = (raw or "").strip().strip("`").strip()
+    first_line = text.splitlines()[0] if text else ""
+    return re.sub(r"(?<=\d),(?=\d)", "", first_line).strip()
+
+
+def _format_number(value: float) -> str:
+    """Display form: at most 2 decimals, no trailing zeros."""
+    return f"{round(value, 2):.2f}".rstrip("0").rstrip(".")
+
+
+def _compute_in_code(context: str, query: str) -> dict:
+    """One short extra call for an arithmetic expression, then a safe evaluation.
+
+    Never raises: every failure (call error, timeout, no/invalid expression)
+    comes back in ``error`` with ``used`` False. The call uses the accurate
+    model, temperature 0, CHATBOT_CALC_MAX_TOKENS and CHATBOT_CALC_TIMEOUT_S.
+    """
+    settings = get_settings()
+    started = time.perf_counter()
+    result = {"attempted": True, "used": False, "expression": None, "value": None, "error": None, "seconds": 0.0}
+    try:
+        client = ollama.Client(host=settings.ollama_host, timeout=settings.chatbot_calc_timeout_s)
+        request = _chat_request(
+            _build_user_message(context, query),
+            settings.chatbot_llm_model_accurate,
+            system_prompt=get_calc_prompt(),
+            num_predict=settings.chatbot_calc_max_tokens,
+            temperature=_CALC_TEMPERATURE,
+        )
+        expression = _clean_expression(client.chat(**request)["message"]["content"])
+        if not expression or expression.upper() == "NONE":
+            raise ValueError("the model returned no expression")
+        result.update(used=True, expression=expression, value=_safe_eval(expression))
+    except Exception as e:  # any failure must leave the normal path untouched
+        result["error"] = f"{type(e).__name__}: {e}"
+    result["seconds"] = round(time.perf_counter() - started, 2)
+    return result
+
+
+def _apply_code_calculation(context: str, query: str, user_message: str, stats: dict) -> str:
+    """Append the code-computed result to the user message when CHATBOT_CALC_IN_CODE
+    is on and the question matches CHATBOT_CALC_QUESTION_PATTERN; otherwise return
+    it unchanged. Called from _build_prompt_with_guard, so the streaming and
+    non-streaming paths share it. ``stats["calc"]`` records what happened for the
+    debug dump."""
+    settings = get_settings()
+    calc = {
+        "enabled": settings.chatbot_calc_in_code, "attempted": False, "used": False,
+        "expression": None, "value": None, "error": None, "seconds": 0.0,
+    }
+    stats["calc"] = calc
+    if not settings.chatbot_calc_in_code or not _wants_calc(query):
+        return user_message
+    if stats.get("threads_used", 0) == 0:
+        calc["error"] = "no context to calculate from"
+        return user_message
+
+    calc.update(_compute_in_code(context, query))
+    if calc["used"]:
+        shown = _format_number(calc["value"])
+        logger.info(
+            "Calc: expression=%r value=%s extra_seconds=%.2f", calc["expression"], shown, calc["seconds"],
+        )
+        return f"{user_message}\n\nComputed result: {calc['expression']} = {shown}. Use this value; do not recompute."
+    logger.warning(
+        "Calc skipped (%s) after %.2fs - continuing with the normal path", calc["error"], calc["seconds"],
+    )
+    return user_message
+
+
 def _build_prompt_with_guard(retrieved: list[dict], query: str) -> tuple[str, str, dict]:
     """Return (context, user_message, stats), rebuilding once with a smaller
     budget if the assembled prompt exceeds CHATBOT_PROMPT_CHAR_CEILING.
 
     Never depends on Ollama truncation: if the first build is too large we
-    rebuild the context with a reduced ``budget_chars`` a single time.
+    rebuild the context with a reduced ``budget_chars`` a single time. With
+    CHATBOT_CALC_IN_CODE on, a calculation question also gets its code-computed
+    result appended (see _apply_code_calculation).
     ``stats`` carries build_context's diagnostics (mode, threads and blocks
-    kept/total, characters before/after cleaning and sent, cuts) for the
-    per-request logs and the debug dump.
+    kept/total, characters before/after cleaning and sent, cuts) and the
+    calculation outcome for the per-request logs and the debug dump.
 
     When CHATBOT_DEBUG_PROMPT is on, logs which threads were retrieved
     (subject + rank) and how many blocks build_context kept per thread.
@@ -181,6 +326,7 @@ def _build_prompt_with_guard(retrieved: list[dict], query: str) -> tuple[str, st
         stats["chars_raw"], stats["chars_cleaned"], stats["chars_sent"],
         stats["dedup_removed"], stats["embeddings"], len(stats["cuts"]),
     )
+    user_message = _apply_code_calculation(context, query, user_message, stats)
     _debug_log_retrieval(retrieved, stats)
 
     return context, user_message, stats
@@ -243,10 +389,32 @@ def _format_selection_report(stats: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_calc_report(calc: dict | None) -> str:
+    """Debug-dump summary of the code calculation: whether it was used, the
+    expression and the value."""
+    if not calc or not calc.get("enabled"):
+        return "code calculation: off (CHATBOT_CALC_IN_CODE)\n"
+    if not calc["attempted"]:
+        reason = calc["error"] or "question does not match CHATBOT_CALC_QUESTION_PATTERN"
+        return f"code calculation: not used ({reason})\n"
+    if calc["used"]:
+        return (
+            "code calculation: USED\n"
+            f"expression: {calc['expression']}\n"
+            f"value: {_format_number(calc['value'])}  (raw {calc['value']!r})\n"
+            f"extra seconds: {calc['seconds']}\n"
+        )
+    return (
+        f"code calculation: attempted but FAILED ({calc['error']}) after {calc['seconds']}s - "
+        "normal path used\n"
+    )
+
+
 def _debug_dump_prompt(user_message: str, raw_answer: str, stats: dict | None = None) -> None:
     """Write the final prompt (system + context + question), the context
-    selection report and the RAW LLM answer (before the hallucination regex /
-    NOT_FOUND replacement) to the debug file, overwriting it each request.
+    selection report, the code-calculation report and the RAW LLM answer
+    (before the hallucination regex / NOT_FOUND replacement) to the debug file,
+    overwriting it each request.
 
     No-op unless CHATBOT_DEBUG_PROMPT is on. Never raises: a debug-dump
     failure must not break the chat response.
@@ -265,6 +433,8 @@ def _debug_dump_prompt(user_message: str, raw_answer: str, stats: dict | None = 
             f"{get_system_prompt()}\n\n"
             "===== CONTEXT SELECTION =====\n"
             f"{_format_selection_report(stats or {})}\n"
+            "===== CODE CALCULATION =====\n"
+            f"{_format_calc_report((stats or {}).get('calc'))}\n"
             "===== USER MESSAGE (context + question) =====\n"
             f"{user_message}\n\n"
             "===== RAW LLM ANSWER (pre hallucination/NOT_FOUND) =====\n"

@@ -27,6 +27,8 @@ def make_cfg(**overrides) -> ContextConfig:
         dedup_similarity=0.9, dedup_min_chars=60, short_line_chars=60,
         table_min_lines=2, table_min_numbers=3, block_max_chars=800,
         partial_head_share=0.5, thin_body_chars=300, attachment_max_chars=1500,
+        signature_max_lines=6, signature_max_words=6, signature_caps_share=0.5,
+        signature_address_pattern=r"\b(road|street|floor)\b",
     )
     values.update(overrides)
     return ContextConfig(**values)

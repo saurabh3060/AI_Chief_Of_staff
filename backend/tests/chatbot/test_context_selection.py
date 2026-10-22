@@ -22,6 +22,8 @@ def make_cfg(**overrides) -> ContextConfig:
         dedup_similarity=0.9, dedup_min_chars=60, short_line_chars=60,
         table_min_lines=2, table_min_numbers=3, block_max_chars=800,
         partial_head_share=0.5, thin_body_chars=300, attachment_max_chars=1500,
+        signature_max_lines=6, signature_max_words=6, signature_caps_share=0.5,
+        signature_address_pattern=r"\b(road|street|floor)\b",
     )
     values.update(overrides)
     return ContextConfig(**values)
@@ -307,6 +309,42 @@ def test_signature_after_a_sign_off_is_removed_but_content_sentences_are_not():
     assert "A later paragraph with more detail" in out
 
 
+_BODY_LINE = "The segment target is confirmed for the coming year after the committee review."
+
+
+def test_signature_block_with_a_figure_is_kept():
+    out = build([_thread("Plan", f"{_BODY_LINE}\nRegards,\nA. Person\nTarget 5 percent")], "segment target")
+    assert "A. Person" in out and "Target 5 percent" in out
+
+
+def test_signature_with_name_title_and_address_is_removed():
+    body = f"{_BODY_LINE}\nRegards,\nA. Person\nHead of Planning\n12 Main Road, Pune"
+    out = build([_thread("Plan", body)], "segment target")
+    assert _BODY_LINE in out
+    assert "A. Person" not in out and "Head of Planning" not in out and "Main Road" not in out
+
+
+def test_signature_longer_than_the_line_limit_is_kept():
+    names = "\n".join(f"{word} Team" for word in ("First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh"))
+    out = build([_thread("Plan", f"{_BODY_LINE}\nRegards,\n{names}")], "segment target")
+    assert "First Team" in out and "Seventh Team" in out
+
+
+def test_signature_at_the_end_of_a_message_without_a_sign_off_is_removed():
+    out = build([_thread("Plan", f"{_BODY_LINE}\n\nA. Person\nHead of Planning")], "segment target")
+    assert _BODY_LINE in out and "A. Person" not in out and "Head of Planning" not in out
+
+
+def test_the_only_paragraph_of_a_message_is_never_removed_as_a_signature():
+    out = build([_thread("Plan Notes", "Segment Owners\nA. Person")], "segment owners")
+    assert "A. Person" in out
+
+
+def test_last_paragraph_with_a_figure_is_kept():
+    out = build([_thread("Plan", f"{_BODY_LINE}\n\nTarget 5 percent")], "segment target")
+    assert "Target 5 percent" in out
+
+
 def test_thin_body_draws_matching_attachment_blocks_only():
     thread = _thread(
         "Short Mail", "See attached.",
@@ -363,6 +401,7 @@ def _settings(**over):
         chatbot_llm_model_fast="fast-model",
         chatbot_llm_model_accurate="accurate-model",
         chatbot_numeric_question_pattern=r"\bhow\s+(much|many)\b|\bwhat\s+(percentage|percent)\b",
+        chatbot_calc_question_pattern=r"\bcalculate\b|\btotal\b",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -374,6 +413,8 @@ def _settings(**over):
     (True, "How many cards were sold?", "accurate-model"),
     (True, "By how much did CASA decline?", "accurate-model"),
     (True, "What percentage of cards are active?", "accurate-model"),
+    (True, "Calculate the combined figure", "accurate-model"),   # calculation pattern only
+    (False, "Calculate the combined figure", "default-model"),   # routing off: unchanged
     (True, "Summarise the treasury update", "fast-model"),
 ])
 def test_model_routing(monkeypatch, routing, question, expected):
@@ -389,3 +430,130 @@ def test_bad_numeric_pattern_falls_back_to_fast_model(monkeypatch):
         lambda: _settings(chatbot_model_routing=True, chatbot_numeric_question_pattern="(unclosed"),
     )
     assert service._select_model("How many cards?") == "fast-model"
+
+
+# ── Arithmetic in code (service) ──────────────────────────────
+
+@pytest.mark.parametrize("expression,expected", [
+    ("2*3+4/2", 8.0),
+    ("(1+2)**2", 9.0),
+    ("-5+2", -3.0),
+    ("100 / (1 + 15/100)", 100 / 1.15),
+])
+def test_safe_eval_accepts_plain_arithmetic(expression, expected):
+    service = pytest.importorskip("chatbot.service")
+    assert service._safe_eval(expression) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("expression", [
+    "__import__('os').system('x')", "abs(-1)", "a + 1", "1 if 1 else 2", "[1, 2]", "'x' * 3",
+    "1 < 2", "1e999 * 1e999", "9 ** 9 ** 9", "(-8) ** 0.5", "1 / 0", "",
+])
+def test_safe_eval_rejects_everything_else(expression):
+    service = pytest.importorskip("chatbot.service")
+    with pytest.raises(Exception):
+        service._safe_eval(expression)
+
+
+def test_expression_cleaning_and_number_formatting():
+    service = pytest.importorskip("chatbot.service")
+    assert service._clean_expression("```\n1,200 * 3\n```") == "1200 * 3"
+    assert service._clean_expression("1,20,000 / 4\nextra words") == "120000 / 4"
+    assert service._format_number(6521.7391) == "6521.74"
+    assert service._format_number(1800.0) == "1800"
+    assert service._format_number(0.5) == "0.5"
+
+
+def _calc_settings(**over):
+    values = dict(
+        chatbot_calc_in_code=True, chatbot_calc_max_tokens=80, chatbot_calc_timeout_s=20.0,
+        ollama_host="http://ollama.invalid", chatbot_max_tokens=256, chatbot_temperature=0.3,
+        chatbot_repeat_penalty=1.0, chatbot_llm_num_ctx=4096, chatbot_num_thread=8,
+        chatbot_keep_alive=-1,
+    )
+    values.update(over)
+    return _settings(**values)
+
+
+def test_calculation_result_is_appended_to_the_prompt(monkeypatch):
+    service = pytest.importorskip("chatbot.service")
+    monkeypatch.setattr(service, "get_settings", lambda: _calc_settings())
+    monkeypatch.setattr(
+        service, "_compute_in_code",
+        lambda context, query: {"attempted": True, "used": True, "expression": "600*3",
+                                "value": 1800.0, "error": None, "seconds": 0.5},
+    )
+    stats = {"threads_used": 1}
+    out = service._apply_code_calculation("ctx", "Calculate the total", "BASE", stats)
+    assert out == "BASE\n\nComputed result: 600*3 = 1800. Use this value; do not recompute."
+    assert stats["calc"]["used"] is True and stats["calc"]["expression"] == "600*3"
+
+
+def test_calculation_is_skipped_when_off_or_not_a_calculation_question(monkeypatch):
+    service = pytest.importorskip("chatbot.service")
+
+    def boom(context, query):
+        raise AssertionError("the extra call must not happen")
+
+    monkeypatch.setattr(service, "_compute_in_code", boom)
+    stats = {"threads_used": 1}
+    monkeypatch.setattr(service, "get_settings", lambda: _calc_settings(chatbot_calc_in_code=False))
+    assert service._apply_code_calculation("ctx", "Calculate the total", "BASE", stats) == "BASE"
+    monkeypatch.setattr(service, "get_settings", lambda: _calc_settings())
+    assert service._apply_code_calculation("ctx", "Summarise the update", "BASE", stats) == "BASE"
+    assert stats["calc"]["attempted"] is False
+
+
+def test_failed_calculation_leaves_the_prompt_unchanged(monkeypatch):
+    service = pytest.importorskip("chatbot.service")
+    monkeypatch.setattr(service, "get_settings", lambda: _calc_settings())
+    monkeypatch.setattr(
+        service, "_compute_in_code",
+        lambda context, query: {"attempted": True, "used": False, "expression": None,
+                                "value": None, "error": "ValueError: bad", "seconds": 1.0},
+    )
+    stats = {"threads_used": 1}
+    assert service._apply_code_calculation("ctx", "Calculate the total", "BASE", stats) == "BASE"
+    assert stats["calc"]["used"] is False and stats["calc"]["error"] == "ValueError: bad"
+
+
+def test_compute_in_code_uses_the_accurate_model_with_the_configured_limits(monkeypatch):
+    service = pytest.importorskip("chatbot.service")
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, host=None, **kwargs):
+            seen["client"] = (host, kwargs)
+
+        def chat(self, **request):
+            seen["request"] = request
+            return {"message": {"content": "600 * 3"}}
+
+    monkeypatch.setattr(service, "get_settings", lambda: _calc_settings())
+    monkeypatch.setattr(service, "get_calc_prompt", lambda: "CALC PROMPT")
+    monkeypatch.setattr(service.ollama, "Client", FakeClient)
+
+    result = service._compute_in_code("context text", "Calculate the total")
+    assert result["used"] is True and result["expression"] == "600 * 3" and result["value"] == 1800.0
+    assert seen["client"] == ("http://ollama.invalid", {"timeout": 20.0})
+    request = seen["request"]
+    assert request["model"] == "accurate-model"
+    assert request["messages"][0] == {"role": "system", "content": "CALC PROMPT"}
+    assert request["options"]["num_predict"] == 80 and request["options"]["temperature"] == 0.0
+
+
+def test_compute_in_code_never_raises(monkeypatch):
+    service = pytest.importorskip("chatbot.service")
+
+    class BrokenClient:
+        def __init__(self, host=None, **kwargs):
+            pass
+
+        def chat(self, **request):
+            raise TimeoutError("timed out")
+
+    monkeypatch.setattr(service, "get_settings", lambda: _calc_settings())
+    monkeypatch.setattr(service, "get_calc_prompt", lambda: "CALC PROMPT")
+    monkeypatch.setattr(service.ollama, "Client", BrokenClient)
+    result = service._compute_in_code("context text", "Calculate the total")
+    assert result["used"] is False and "TimeoutError" in result["error"]

@@ -849,8 +849,9 @@ class Settings(BaseSettings):
     )
     # Model routing. With CHATBOT_MODEL_ROUTING off (default) every question
     # uses CHATBOT_LLM_MODEL, exactly as before. With it on, questions that ask
-    # for a number (matched by CHATBOT_NUMERIC_QUESTION_PATTERN) go to the
-    # accurate model and every other question goes to the fast model.
+    # for a number (CHATBOT_NUMERIC_QUESTION_PATTERN) or for a calculation
+    # (CHATBOT_CALC_QUESTION_PATTERN) go to the accurate model and every other
+    # question goes to the fast model.
     chatbot_model_routing: bool = Field(
         default=False,
         alias="CHATBOT_MODEL_ROUTING",
@@ -871,6 +872,45 @@ class Settings(BaseSettings):
         default=r"\bhow\s+(much|many)\b|\bwhat\s+(percentage|percent)\b",
         alias="CHATBOT_NUMERIC_QUESTION_PATTERN",
         validation_alias="CHATBOT_NUMERIC_QUESTION_PATTERN",
+    )
+    # Regex (case-insensitive) that marks a question as asking for a
+    # calculation. Used for model routing and for CHATBOT_CALC_IN_CODE.
+    chatbot_calc_question_pattern: str = Field(
+        default=(
+            r"\b(calculate|calculation|total|sum|how\s+many|how\s+much"
+            r"|percent(?:age)?\s+of|higher\s+than|lower\s+than|baseline"
+            r"|per\s+(?:month|quarter|year))\b"
+        ),
+        alias="CHATBOT_CALC_QUESTION_PATTERN",
+        validation_alias="CHATBOT_CALC_QUESTION_PATTERN",
+    )
+    # Do the arithmetic in code instead of trusting the model. When on and the
+    # question matches CHATBOT_CALC_QUESTION_PATTERN, one short extra call asks
+    # the accurate model for ONE arithmetic expression; Python evaluates it
+    # (ast-based, numbers and + - * / ** only) and the result is appended to the
+    # prompt. Any failure falls back to the normal path unchanged.
+    chatbot_calc_in_code: bool = Field(
+        default=False,
+        alias="CHATBOT_CALC_IN_CODE",
+        validation_alias="CHATBOT_CALC_IN_CODE",
+    )
+    # Token cap and timeout (seconds) of that extra call.
+    chatbot_calc_max_tokens: int = Field(
+        default=80,
+        alias="CHATBOT_CALC_MAX_TOKENS",
+        validation_alias="CHATBOT_CALC_MAX_TOKENS",
+    )
+    chatbot_calc_timeout_s: float = Field(
+        default=20.0,
+        alias="CHATBOT_CALC_TIMEOUT_S",
+        validation_alias="CHATBOT_CALC_TIMEOUT_S",
+    )
+    # Editable file with the instruction for that extra call (relative paths
+    # resolve against the backend root; re-read when it changes).
+    chatbot_calc_prompt_path: str = Field(
+        default="chatbot/calc_prompt.txt",
+        alias="CHATBOT_CALC_PROMPT_PATH",
+        validation_alias="CHATBOT_CALC_PROMPT_PATH",
     )
     # Character budget for the compact, deduplicated RAG context sent to the
     # chatbot LLM (chatbot.retriever.build_context). ~4000 chars ≈ 1000 tokens;
@@ -976,6 +1016,37 @@ class Settings(BaseSettings):
         default=1500,
         alias="CHATBOT_CONTEXT_ATTACHMENT_MAX_CHARS",
         validation_alias="CHATBOT_CONTEXT_ATTACHMENT_MAX_CHARS",
+    )
+    # Signature blocks (name / job title / company / address lines after a
+    # sign-off, or at the end of a message) are removed only when ALL of these
+    # hold: at most this many lines, each short (CHATBOT_CONTEXT_SHORT_LINE_CHARS),
+    # no figure outside an address line, no sentence punctuation, and for name/
+    # title/company lines at most this many words of which at least this share
+    # start with a capital letter. One doubtful line keeps the whole block.
+    chatbot_context_signature_max_lines: int = Field(
+        default=6,
+        alias="CHATBOT_CONTEXT_SIGNATURE_MAX_LINES",
+        validation_alias="CHATBOT_CONTEXT_SIGNATURE_MAX_LINES",
+    )
+    chatbot_context_signature_max_words: int = Field(
+        default=6,
+        alias="CHATBOT_CONTEXT_SIGNATURE_MAX_WORDS",
+        validation_alias="CHATBOT_CONTEXT_SIGNATURE_MAX_WORDS",
+    )
+    chatbot_context_signature_caps_share: float = Field(
+        default=0.5,
+        alias="CHATBOT_CONTEXT_SIGNATURE_CAPS_SHARE",
+        validation_alias="CHATBOT_CONTEXT_SIGNATURE_CAPS_SHARE",
+    )
+    # Regex (case-insensitive) that marks a short line as a street/postal
+    # address line, which may contain digits.
+    chatbot_context_signature_address_pattern: str = Field(
+        default=(
+            r"\b(road|rd|street|st|avenue|ave|lane|floor|tower|building|plot"
+            r"|sector|suite|block|colony|nagar|marg|pin|zip)\b"
+        ),
+        alias="CHATBOT_CONTEXT_SIGNATURE_ADDRESS_PATTERN",
+        validation_alias="CHATBOT_CONTEXT_SIGNATURE_ADDRESS_PATTERN",
     )
     # Comma-separated extra words ignored when matching question words to
     # emails (on top of the built-in stopword/generic-word lists).

@@ -15,6 +15,7 @@ adapted to:
     weaviate_client.py
 """
 
+import functools
 import re
 import time
 from dataclasses import dataclass
@@ -470,6 +471,10 @@ class ContextConfig:
     partial_head_share: float   # CHATBOT_CONTEXT_PARTIAL_HEAD_SHARE
     thin_body_chars: int        # CHATBOT_CONTEXT_THIN_BODY_CHARS
     attachment_max_chars: int   # CHATBOT_CONTEXT_ATTACHMENT_MAX_CHARS
+    signature_max_lines: int    # CHATBOT_CONTEXT_SIGNATURE_MAX_LINES
+    signature_max_words: int    # CHATBOT_CONTEXT_SIGNATURE_MAX_WORDS
+    signature_caps_share: float  # CHATBOT_CONTEXT_SIGNATURE_CAPS_SHARE
+    signature_address_pattern: str  # CHATBOT_CONTEXT_SIGNATURE_ADDRESS_PATTERN
     ignore_words: frozenset = frozenset()   # CHATBOT_CONTEXT_IGNORE_WORDS
 
     @classmethod
@@ -492,6 +497,10 @@ class ContextConfig:
             partial_head_share=s.chatbot_context_partial_head_share,
             thin_body_chars=s.chatbot_context_thin_body_chars,
             attachment_max_chars=s.chatbot_context_attachment_max_chars,
+            signature_max_lines=s.chatbot_context_signature_max_lines,
+            signature_max_words=s.chatbot_context_signature_max_words,
+            signature_caps_share=s.chatbot_context_signature_caps_share,
+            signature_address_pattern=s.chatbot_context_signature_address_pattern,
             ignore_words=frozenset(
                 w.strip().lower()
                 for w in s.chatbot_context_ignore_words.split(",")
@@ -562,39 +571,94 @@ def _is_boilerplate_line(line: str) -> bool:
     return bool(_EMAIL_RE.search(line)) and len(_EMAIL_RE.sub("", line).strip()) < 15
 
 
+@functools.lru_cache(maxsize=8)
+def _address_regex(pattern: str):
+    """Compiled CHATBOT_CONTEXT_SIGNATURE_ADDRESS_PATTERN, or None if invalid/empty."""
+    if not pattern:
+        return None
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        logger.warning("Invalid CHATBOT_CONTEXT_SIGNATURE_ADDRESS_PATTERN %r: %s", pattern, e)
+        return None
+
+
+def _is_signature_line(line: str, cfg: ContextConfig) -> bool:
+    """True only for a line that is clearly part of a signature block: a short
+    address line, or a short person-name / job-title / company line. A line that
+    carries a figure (digit, %, currency mark) outside an address, ends like a
+    sentence, or reads like ordinary words is NOT a signature line - when unsure,
+    the line is kept."""
+    if len(line) > cfg.short_line_chars or re.search(r"[%₹$€£¥]", line):
+        return False
+    address = _address_regex(cfg.signature_address_pattern)
+    if address and address.search(line) and (_FIGURE_RE.search(line) or "," in line):
+        return True
+    if _FIGURE_RE.search(line) or line.rstrip().endswith((".", "!", "?", ":", ";")):
+        return False
+    words = line.split()
+    letters = [w for w in words if w[:1].isalpha()]
+    if not letters or len(words) > cfg.signature_max_words:
+        return False
+    return sum(1 for w in letters if w[:1].isupper()) / len(letters) >= cfg.signature_caps_share
+
+
+def _is_signature_block(lines: list[str], cfg: ContextConfig) -> bool:
+    """A signature block is 1..signature_max_lines lines that ALL look like
+    signature lines; one doubtful line makes the whole block ordinary text."""
+    return 1 <= len(lines) <= cfg.signature_max_lines and all(_is_signature_line(line, cfg) for line in lines)
+
+
 def _clean_paragraphs(text: str, cfg: ContextConfig) -> list[list[str]]:
     """Return the paragraphs (lists of lines) left after removing headers,
-    reply boundaries, separators, signatures, address/url lines and disclaimer
-    paragraphs. Remaining lines are kept as written (only trimmed at the ends).
+    reply boundaries, separators, signature blocks, address/url lines and
+    disclaimer paragraphs. Remaining lines are kept as written (only trimmed at
+    the ends).
+
+    A signature block is removed only when it directly follows a sign-off line,
+    or is the last paragraph of a message (and not the message's only
+    paragraph), and every one of its lines passes ``_is_signature_line``.
     """
     paragraphs: list[list[str]] = []
     current: list[str] = []
-    in_signature = False
+    signature: list[str] | None = None     # lines collected after a sign-off line
+    message_start = 0                      # index in ``paragraphs`` where this message began
 
     def flush() -> None:
-        nonlocal current
+        nonlocal current, signature
+        if signature is not None:
+            if signature and not _is_signature_block(signature, cfg):
+                current.extend(signature)  # not clearly a signature: keep the lines
+            signature = None
         if current and not _DISCLAIMER_RE.search(" ".join(current)):
             paragraphs.append(current)
         current = []
+
+    def end_message() -> None:
+        nonlocal message_start
+        flush()
+        message = paragraphs[message_start:]
+        if len(message) >= 2 and _is_signature_block(message[-1], cfg):
+            paragraphs.pop()
+        message_start = len(paragraphs)
 
     for raw in _fix_encoding(text).splitlines():
         line = raw.strip()
         if not line:
             flush()
-            in_signature = False
             continue
         if _REPLY_BOUNDARY_RE.match(line) or _HEADER_LINE_RE.match(line) or _SEPARATOR_RE.match(line):
-            in_signature = False
-            continue
-        if in_signature:
-            continue
-        if len(line) <= cfg.short_line_chars and _SIGNOFF_RE.match(line):
-            in_signature = True
+            end_message()
             continue
         if _is_boilerplate_line(line):
             continue
-        current.append(line)
-    flush()
+        if signature is not None:
+            signature.append(line)
+        elif len(line) <= cfg.short_line_chars and _SIGNOFF_RE.match(line):
+            signature = []
+        else:
+            current.append(line)
+    end_message()
     return paragraphs
 
 
