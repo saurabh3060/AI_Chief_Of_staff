@@ -34,6 +34,25 @@ def _redis_enabled(settings: Settings) -> bool:
     return bool(getattr(settings, "redis_enabled", False))
 
 
+async def _invalidate_meeting_clusters_if_changed(settings: Settings, written: int, source: str) -> None:
+    """Invalidate the derived ``meeting_clusters:*`` cache only if ``written`` rows changed.
+
+    The PostgreSQL writers skip rows whose content hash is unchanged and return
+    how many rows they really wrote. With nothing written the matching inputs
+    are identical, so the cached matches are still exactly what a recompute
+    would produce - clearing them would only force ~25 s of pointless re-matching
+    on the next calendar request.
+    """
+    from agent_email import redis_cache
+
+    if written and written > 0:
+        await redis_cache.clear_meeting_clusters(settings)
+    else:
+        logger.info(
+            "[REDIS][CACHE-INVALIDATE] meeting_clusters kept: %s write changed 0 rows", source
+        )
+
+
 # ---------------------------------------------------------------------------
 # Clusters
 # ---------------------------------------------------------------------------
@@ -94,7 +113,10 @@ async def write_cluster_records(
         # Cluster rows changed => every per-meeting matched-cluster result is
         # potentially stale. Invalidate the derived meeting_clusters cache so
         # the next meeting-list / brief request recomputes against new data.
-        await redis_cache.clear_meeting_clusters(active)
+        # `written` is the number of rows whose content actually changed
+        # (unchanged rows are skipped by their content hash), so a write that
+        # changed nothing leaves every derived match valid - keep the cache.
+        await _invalidate_meeting_clusters_if_changed(active, written, "clusters")
     return written
 
 
@@ -175,8 +197,9 @@ async def write_meeting_embeddings(
         )
         # The meeting query vector feeds the matched-cluster computation, so a
         # changed meeting embedding can change the match. Invalidate the
-        # derived per-meeting cache.
-        await redis_cache.clear_meeting_clusters(active)
+        # derived per-meeting cache - but only when a row really changed
+        # (`written` excludes rows skipped as unchanged by content hash).
+        await _invalidate_meeting_clusters_if_changed(active, written, "meeting_embeddings")
     return written
 
 
@@ -239,8 +262,9 @@ async def write_meeting_history(
         if snapshot:
             await redis_cache.set_meeting_history(snapshot, active)
         # Meeting history feeds anchoring/recurrence inputs; invalidate the
-        # derived per-meeting matched-cluster cache so refreshes stay fresh.
-        await redis_cache.clear_meeting_clusters(active)
+        # derived per-meeting matched-cluster cache so refreshes stay fresh -
+        # only when a row really changed (`written` excludes unchanged rows).
+        await _invalidate_meeting_clusters_if_changed(active, written, "meeting_history")
     return written
 
 
