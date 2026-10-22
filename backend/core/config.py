@@ -889,13 +889,93 @@ class Settings(BaseSettings):
         alias="CHATBOT_CONTEXT_TOP_THREADS",
         validation_alias="CHATBOT_CONTEXT_TOP_THREADS",
     )
-    # Share of the context budget reserved for table rows (never dropped by the
-    # noise filter, length rule, dedup or scoring). Rows are cut only when they
-    # exceed this share, and a WARNING with the thread subject is logged.
-    chatbot_context_table_fraction: float = Field(
+    # ---- build_context: blocks, selection, cleaning (see docs/build_context_redesign.md) ----
+    # Blocks next to a chosen block that are added with it (labels, context).
+    chatbot_context_neighbor_blocks: int = Field(
+        default=1,
+        alias="CHATBOT_CONTEXT_NEIGHBOR_BLOCKS",
+        validation_alias="CHATBOT_CONTEXT_NEIGHBOR_BLOCKS",
+    )
+    # Smallest share of the budget a thread being sent is guaranteed (0-1).
+    chatbot_context_min_thread_share: float = Field(
+        default=0.2,
+        alias="CHATBOT_CONTEXT_MIN_THREAD_SHARE",
+        validation_alias="CHATBOT_CONTEXT_MIN_THREAD_SHARE",
+    )
+    # Added to the score (0-1 scale) of a block that contains figures.
+    chatbot_context_figure_bonus: float = Field(
+        default=0.1,
+        alias="CHATBOT_CONTEXT_FIGURE_BONUS",
+        validation_alias="CHATBOT_CONTEXT_FIGURE_BONUS",
+    )
+    # Rank blocks with embedding similarity as well as BM25. Off = BM25 only
+    # (use it if the embedding call is slow). Not used when everything fits.
+    chatbot_context_use_embeddings: bool = Field(
+        default=True,
+        alias="CHATBOT_CONTEXT_USE_EMBEDDINGS",
+        validation_alias="CHATBOT_CONTEXT_USE_EMBEDDINGS",
+    )
+    # Weight of the embedding similarity in the hybrid score (BM25 gets 1 - this).
+    chatbot_context_embedding_weight: float = Field(
         default=0.5,
-        alias="CHATBOT_CONTEXT_TABLE_FRACTION",
-        validation_alias="CHATBOT_CONTEXT_TABLE_FRACTION",
+        alias="CHATBOT_CONTEXT_EMBEDDING_WEIGHT",
+        validation_alias="CHATBOT_CONTEXT_EMBEDDING_WEIGHT",
+    )
+    # A block repeats an earlier one (quoted history) at this word similarity
+    # (0-1) or better, provided it carries exactly the same figures.
+    chatbot_context_dedup_similarity: float = Field(
+        default=0.9,
+        alias="CHATBOT_CONTEXT_DEDUP_SIMILARITY",
+        validation_alias="CHATBOT_CONTEXT_DEDUP_SIMILARITY",
+    )
+    # Blocks shorter than this are never treated as repeats.
+    chatbot_context_dedup_min_chars: int = Field(
+        default=60,
+        alias="CHATBOT_CONTEXT_DEDUP_MIN_CHARS",
+        validation_alias="CHATBOT_CONTEXT_DEDUP_MIN_CHARS",
+    )
+    # A line up to this long counts as a short (table-like) line.
+    chatbot_context_short_line_chars: int = Field(
+        default=60,
+        alias="CHATBOT_CONTEXT_SHORT_LINE_CHARS",
+        validation_alias="CHATBOT_CONTEXT_SHORT_LINE_CHARS",
+    )
+    # Consecutive table-like lines needed to form a table block.
+    chatbot_context_table_min_lines: int = Field(
+        default=2,
+        alias="CHATBOT_CONTEXT_TABLE_MIN_LINES",
+        validation_alias="CHATBOT_CONTEXT_TABLE_MIN_LINES",
+    )
+    # A longer line still counts as a table row when it holds this many numbers.
+    chatbot_context_table_min_numbers: int = Field(
+        default=3,
+        alias="CHATBOT_CONTEXT_TABLE_MIN_NUMBERS",
+        validation_alias="CHATBOT_CONTEXT_TABLE_MIN_NUMBERS",
+    )
+    # A prose paragraph longer than this is split at line boundaries into blocks.
+    chatbot_context_block_max_chars: int = Field(
+        default=800,
+        alias="CHATBOT_CONTEXT_BLOCK_MAX_CHARS",
+        validation_alias="CHATBOT_CONTEXT_BLOCK_MAX_CHARS",
+    )
+    # Last resort for a block larger than the room left: share of that room
+    # given to the block's first part (the rest goes to its figure lines).
+    chatbot_context_partial_head_share: float = Field(
+        default=0.5,
+        alias="CHATBOT_CONTEXT_PARTIAL_HEAD_SHARE",
+        validation_alias="CHATBOT_CONTEXT_PARTIAL_HEAD_SHARE",
+    )
+    # A thread whose cleaned body is shorter than this also draws
+    # question-matching blocks from its attachment_data (up to the cap below).
+    chatbot_context_thin_body_chars: int = Field(
+        default=300,
+        alias="CHATBOT_CONTEXT_THIN_BODY_CHARS",
+        validation_alias="CHATBOT_CONTEXT_THIN_BODY_CHARS",
+    )
+    chatbot_context_attachment_max_chars: int = Field(
+        default=1500,
+        alias="CHATBOT_CONTEXT_ATTACHMENT_MAX_CHARS",
+        validation_alias="CHATBOT_CONTEXT_ATTACHMENT_MAX_CHARS",
     )
     # Comma-separated extra words ignored when matching question words to
     # emails (on top of the built-in stopword/generic-word lists).

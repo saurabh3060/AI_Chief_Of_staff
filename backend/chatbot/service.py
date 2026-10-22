@@ -147,17 +147,19 @@ def _build_prompt_with_guard(retrieved: list[dict], query: str) -> tuple[str, st
 
     Never depends on Ollama truncation: if the first build is too large we
     rebuild the context with a reduced ``budget_chars`` a single time.
-    ``stats`` carries build_context's diagnostics (threads in/used, table rows
-    kept/cut, per-thread line counts) for the per-request metrics log.
+    ``stats`` carries build_context's diagnostics (mode, threads and blocks
+    kept/total, characters before/after cleaning and sent, cuts) for the
+    per-request logs and the debug dump.
 
     When CHATBOT_DEBUG_PROMPT is on, logs which threads were retrieved
-    (subject + rank) and how many sentences build_context kept per thread.
+    (subject + rank) and how many blocks build_context kept per thread.
     """
-    from chatbot.retriever import build_context
+    from chatbot.retriever import ContextConfig, build_context
 
     settings = get_settings()
+    cfg = ContextConfig.from_settings(settings)
     stats: dict = {}
-    context = build_context(retrieved, query, stats=stats)
+    context = build_context(retrieved, query, cfg=cfg, stats=stats)
     user_message = _build_user_message(context, query)
 
     if len(user_message) > settings.chatbot_prompt_char_ceiling:
@@ -167,10 +169,18 @@ def _build_prompt_with_guard(retrieved: list[dict], query: str) -> tuple[str, st
             len(user_message), settings.chatbot_prompt_char_ceiling, shrunk,
         )
         stats = {}
-        context = build_context(retrieved, query, budget_chars=shrunk, stats=stats)
+        context = build_context(retrieved, query, cfg=cfg, budget_chars=shrunk, stats=stats)
         user_message = _build_user_message(context, query)
 
     stats["context_chars"] = len(context)
+    logger.info(
+        "Context: mode=%s threads=%d/%d blocks=%d/%d chars raw=%d cleaned=%d sent=%d "
+        "dedup_removed=%d embeddings=%s cuts=%d",
+        "everything fit" if stats["mode"] == "everything_fit" else "selection used",
+        stats["threads_used"], stats["threads_in"], stats["blocks_kept"], stats["blocks_total"],
+        stats["chars_raw"], stats["chars_cleaned"], stats["chars_sent"],
+        stats["dedup_removed"], stats["embeddings"], len(stats["cuts"]),
+    )
     _debug_log_retrieval(retrieved, stats)
 
     return context, user_message, stats
@@ -194,17 +204,49 @@ def _debug_log_retrieval(retrieved: list[dict], stats: dict) -> None:
         score = chunk.get("combined_score", chunk.get("score", 0))
         logger.info("[CHATBOT-DEBUG] retrieved rank=%d score=%.3f subject=%r", rank, score, subject)
 
-    for rank, subject, kept in stats.get("kept_per_thread", []):
+    for rank, subject, kept, total in stats.get("kept_per_thread", []):
         logger.info(
-            "[CHATBOT-DEBUG] build_context kept rank=%d sentences=%d subject=%r",
-            rank, kept, subject,
+            "[CHATBOT-DEBUG] build_context kept rank=%d blocks=%d/%d subject=%r",
+            rank, kept, total, subject,
         )
 
 
-def _debug_dump_prompt(user_message: str, raw_answer: str) -> None:
-    """Write the final prompt (system + context + question) and the RAW LLM
-    answer (before the hallucination regex / NOT_FOUND replacement) to the
-    debug file, overwriting it each request.
+def _format_selection_report(stats: dict) -> str:
+    """Human-readable build_context summary for the debug dump: mode, threads,
+    blocks kept/total per thread, characters before cleaning / after cleaning /
+    sent, and every block that was chosen."""
+    if not stats:
+        return "(no context statistics)\n"
+    lines = [
+        "mode: " + ("everything fit (nothing dropped)" if stats["mode"] == "everything_fit"
+                    else "selection used (ranked blocks)"),
+        f"threads: {stats['threads_used']} sent of {stats['threads_in']} retrieved",
+        f"blocks kept/total: {stats['blocks_kept']}/{stats['blocks_total']}",
+        f"characters: before cleaning={stats['chars_raw']} after cleaning={stats['chars_cleaned']} "
+        f"sent={stats['chars_sent']}",
+        f"repeated blocks removed: {stats['dedup_removed']}  embeddings: {stats['embeddings']}",
+    ]
+    for cut in stats["cuts"]:
+        lines.append(
+            f"CUT: thread {cut['subject']!r} block {cut['block']} ({cut['kind']}) kept "
+            f"{cut['lines_kept']}/{cut['lines_total']} lines, {cut['chars_cut']} chars cut"
+        )
+    for thread in stats["chosen"]:
+        kept = len(thread["blocks"])
+        total = next((t for r, _s, _k, t in stats["kept_per_thread"] if r == thread["rank"]), kept)
+        lines.append(f"[rank {thread['rank']}] {thread['subject']!r}: blocks kept {kept}/{total}")
+        for b in thread["blocks"]:
+            lines.append(
+                f"    block {b['pos']} {b['kind']} chars={b['chars']} tier={b['tier']} "
+                f"score={b['score']}{' PARTIAL' if b['partial'] else ''}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _debug_dump_prompt(user_message: str, raw_answer: str, stats: dict | None = None) -> None:
+    """Write the final prompt (system + context + question), the context
+    selection report and the RAW LLM answer (before the hallucination regex /
+    NOT_FOUND replacement) to the debug file, overwriting it each request.
 
     No-op unless CHATBOT_DEBUG_PROMPT is on. Never raises: a debug-dump
     failure must not break the chat response.
@@ -221,6 +263,8 @@ def _debug_dump_prompt(user_message: str, raw_answer: str) -> None:
         contents = (
             "===== SYSTEM PROMPT =====\n"
             f"{get_system_prompt()}\n\n"
+            "===== CONTEXT SELECTION =====\n"
+            f"{_format_selection_report(stats or {})}\n"
             "===== USER MESSAGE (context + question) =====\n"
             f"{user_message}\n\n"
             "===== RAW LLM ANSWER (pre hallucination/NOT_FOUND) =====\n"
@@ -659,7 +703,7 @@ async def answer_question(
     answer_text = response["message"]["content"]
 
     # Debug dump of the final prompt + RAW answer (before any post-processing).
-    _debug_dump_prompt(user_message, answer_text)
+    _debug_dump_prompt(user_message, answer_text, ctx_stats)
 
     # ── Post-LLM hallucination check ─────────────────────────
     # If the LLM ignored the system prompt and hallucinated a capability
@@ -901,7 +945,7 @@ def generate_response_stream(
 
     # Debug dump of the final prompt + RAW streamed answer (before the
     # hallucination regex / NOT_FOUND replacement below).
-    _debug_dump_prompt(user_message, full_response)
+    _debug_dump_prompt(user_message, full_response, ctx_stats)
 
     # ── Post-LLM hallucination check ─────────────────────────
     # If the LLM streamed a hallucinated response, send a correction

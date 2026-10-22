@@ -1,41 +1,48 @@
 """
 tests/chatbot/test_build_context.py
 ======================================
-Unit tests for chatbot.retriever.build_context - the prompt-size
-reduction that keeps ALL retrieved threads but sends only deduplicated,
-question-relevant sentences from each thread's subject + body.
+Unit tests for the lossless cleaning stage of chatbot.retriever.build_context:
+headers, separators, signatures, address blocks and quoted repeats are removed,
+and nothing else is rewritten.
 
 The sample threads below deliberately contain:
-  * repeated quoted reply history (the same sentences across all 3 threads)
+  * repeated quoted reply history (the same paragraph across all 3 threads)
   * header lines (From/Sent/To/Subject/Date), separators, signatures and
     an address block, which must all be stripped
-  * a "Sample N" prefix that must be removed
-so the test can assert the output is compact, header-free, dedup-free and
+so the test can assert the output is compact, header-free and dedup-free and
 still includes content from every thread.
 """
 
 import pytest
 
 from chatbot import retriever
+from chatbot.retriever import ContextConfig
 
 
-def build_context(threads, question, **kwargs):
-    """build_context with every setting passed explicitly (no Settings/.env),
-    and no thread limit so these tests still see all three threads."""
-    kwargs.setdefault("budget_chars", 4000)
-    kwargs.setdefault("max_threads", 10)
-    kwargs.setdefault("table_fraction", 0.5)
-    kwargs.setdefault("ignore_words", set())
-    return retriever.build_context(threads, question, **kwargs)
+def make_cfg(**overrides) -> ContextConfig:
+    """A ContextConfig with every value explicit (no Settings, no .env)."""
+    values = dict(
+        max_chars=4000, top_threads=10, neighbor_blocks=1, min_thread_share=0.2,
+        figure_bonus=0.1, use_embeddings=False, embedding_weight=0.5,
+        dedup_similarity=0.9, dedup_min_chars=60, short_line_chars=60,
+        table_min_lines=2, table_min_numbers=3, block_max_chars=800,
+        partial_head_share=0.5, thin_body_chars=300, attachment_max_chars=1500,
+    )
+    values.update(overrides)
+    return ContextConfig(**values)
+
+
+def build_context(threads, question, budget_chars=None, **cfg_overrides):
+    return retriever.build_context(threads, question, cfg=make_cfg(**cfg_overrides), budget_chars=budget_chars)
 
 
 # A block of quoted reply history that is pasted verbatim into every thread.
 # build_context must keep it only ONCE across all three threads.
 _QUOTED_HISTORY = (
     "-----Original Message-----\n"
-    "From: deepak.kumar@rblbank.com\n"
+    "From: deepak.kumar@example.com\n"
     "Sent: Monday, April 14, 2025 9:00 AM\n"
-    "To: ceo.office@rblbank.com\n"
+    "To: ceo.office@example.com\n"
     "Subject: RE: Wholesale Banking Review\n"
     "\n"
     "The wholesale CASA book grew by eighteen percent during the first quarter.\n"
@@ -48,12 +55,12 @@ def _thread(subject: str, unique_body: str) -> dict:
     return {
         "subject": subject,
         "body": (
-            f"From: analyst@rblbank.com\n"
+            f"From: analyst@example.com\n"
             f"Sent: Tuesday, April 15, 2025 10:30 AM\n"
-            f"To: ceo.office@rblbank.com\n"
+            f"To: ceo.office@example.com\n"
             f"Subject: {subject}\n"
             f"========================================\n"
-            f"Sample 1: {unique_body}\n"
+            f"{unique_body}\n"
             f"Regards,\n"
             f"The Analytics Team\n"
             f"Tel: +91 22 1234 5678\n"
@@ -96,67 +103,51 @@ def test_output_under_budget(sample_threads):
 
 def test_no_header_or_noise_lines(sample_threads):
     """Header/separator/signature/address lines must be stripped."""
-    out = build_context(sample_threads, "April figures", budget_chars=4000)
+    out = build_context(sample_threads, "April figures")
     lowered = out.lower()
 
-    # Header labels at line starts
     for line in out.splitlines():
         assert not line.lower().startswith(("from:", "sent:", "to:", "cc:", "bcc:", "subject:", "date:"))
 
     assert "-----original message-----" not in lowered
     assert "====" not in out
     assert "regards" not in lowered
+    assert "analytics team" not in lowered   # the signature that follows the sign-off
     assert "tel:" not in lowered
-    # The "Sample N" prefix must be removed from kept sentences.
-    assert "sample 1:" not in lowered
+
+
+def test_text_is_not_rewritten(sample_threads):
+    """Cleaning only removes: the kept sentence is byte-for-byte what was written."""
+    out = build_context(sample_threads, "April figures")
+    assert "Wholesale sanctions for April reached nine hundred and twelve crore in total." in out
 
 
 def test_never_uses_forbidden_fields(sample_threads):
     """build_context must use subject + body only, never raw/json/metadata/ids."""
-    out = build_context(sample_threads, "April figures", budget_chars=4000)
-    assert "LEAKED_RAW_CONTENT" not in out
-    assert "LEAKED_JSON" not in out
-    assert "LEAKED_METADATA" not in out
-    assert "LEAKED_ATTACHMENT" not in out
-    assert "LEAKED_MESSAGE_ID" not in out
-    assert "LEAKED_CONVERSATION_ID" not in out
+    out = build_context(sample_threads, "April figures")
+    for leaked in ("LEAKED_RAW_CONTENT", "LEAKED_JSON", "LEAKED_METADATA", "LEAKED_ATTACHMENT",
+                   "LEAKED_MESSAGE_ID", "LEAKED_CONVERSATION_ID"):
+        assert leaked not in out
 
 
 def test_quoted_history_deduplicated(sample_threads):
-    """The shared quoted-history sentence must appear at most once overall."""
-    out = build_context(sample_threads, "wholesale CASA", budget_chars=4000)
-    sentinel = "wholesale casa book grew by eighteen percent"
-    assert out.lower().count(sentinel) <= 1
+    """The shared quoted-history paragraph must appear at most once overall."""
+    out = build_context(sample_threads, "wholesale CASA")
+    assert out.lower().count("wholesale casa book grew by eighteen percent") <= 1
 
 
 def test_every_thread_included(sample_threads):
-    """No thread may be dropped - each subject header block must be present."""
-    out = build_context(sample_threads, "April figures", budget_chars=4000)
+    """Each matching thread keeps its own header block and unique sentence."""
+    out = build_context(sample_threads, "April figures")
     assert "[Email 1: Wholesale Banking Review]" in out
     assert "[Email 2: Retail Liabilities Update]" in out
     assert "[Email 3: Credit Cards Performance]" in out
-
-    # And the unique sentence from each thread survives.
     assert "nine hundred and twelve crore" in out
     assert "twelve percent in april" in out.lower()
     assert "two thousand crore" in out
 
 
-def test_before_after_sizes_printed(sample_threads, capsys):
-    """Print before/after char counts + estimated tokens (chars/4) for a query."""
-    question = "What were the April figures across business units?"
-
-    # "Before": the raw thread text we would otherwise have sent (bodies joined).
-    before_chars = sum(len(t["body"]) for t in sample_threads)
-
-    out = build_context(sample_threads, question, budget_chars=8000)
-    after_chars = len(out)
-
-    with capsys.disabled():
-        print("\n--- build_context before/after ---")
-        print(f"query:         {question}")
-        print(f"before: {before_chars:>6} chars  (~{before_chars // 4} tokens)")
-        print(f"after:  {after_chars:>6} chars  (~{after_chars // 4} tokens)")
-        print(f"reduction: {100 * (before_chars - after_chars) / before_chars:.1f}%")
-
-    assert after_chars < before_chars
+def test_smaller_than_the_raw_threads(sample_threads):
+    before = sum(len(t["body"]) for t in sample_threads)
+    out = build_context(sample_threads, "What were the April figures across business units?")
+    assert len(out) < before

@@ -17,6 +17,7 @@ adapted to:
 
 import re
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import ollama
@@ -48,6 +49,24 @@ def embed_query(text: str) -> np.ndarray:
         options={"num_ctx": _EMBED_NUM_CTX},
     )
     vec = np.array(response["embeddings"], dtype=np.float32)   # shape (1, dim)
+    norms = np.linalg.norm(vec, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return vec / norms
+
+
+def embed_texts(texts: list[str]) -> np.ndarray:
+    """Embed several strings in ONE Ollama call; returns shape ``(n, dim)`` with
+    L2-normalised rows (cosine similarity is a dot product). Same client, model
+    and context cap as embed_query; used by build_context to score blocks.
+    """
+    settings = get_settings()
+    client = ollama.Client(host=settings.ollama_host)
+    response = client.embed(
+        model=settings.embedding_model,
+        input=texts,
+        options={"num_ctx": _EMBED_NUM_CTX},
+    )
+    vec = np.array(response["embeddings"], dtype=np.float32)
     norms = np.linalg.norm(vec, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return vec / norms
@@ -329,37 +348,30 @@ def retrieve_weaviate(
     return results
 
 
-# ── Prompt-size reduction: sentence-level context builder ─────
+# ── Prompt-size reduction: block-based context builder ────────
 #
 # The raw thread text (thread_raw_content / messages_json) repeats quoted
 # reply history, headers, signatures and address blocks, so a 3-thread prompt
-# ran 4,300-8,400 tokens and Ollama truncated it. build_context() sends only
-# the best-ranked threads that share a real keyword with the question, and only
-# their deduplicated, question-relevant sentences (plus protected table rows)
-# from subject + body, capped to a character budget. The budget, thread count
-# and table share come from Settings (CHATBOT_CONTEXT_*); the constants below
-# are fixed heuristics of the text cleaner.
+# ran 4,300-8,400 tokens and Ollama truncated it. build_context() works in
+# four stages:
+#   1. clean   - drop only what carries no information (headers, signatures,
+#                address/url lines, separators, disclaimers, encoding
+#                artifacts) and quoted repeats of earlier blocks. Nothing else
+#                is rewritten, shortened or reordered.
+#   2. blocks  - group the cleaned lines into atomic blocks: paragraphs,
+#                bullet/numbered groups and tables. A label always shares a
+#                block with the value lines under it.
+#   3. select  - if every block of the chosen threads fits the budget, send it
+#                all unchanged; otherwise rank blocks (BM25 + embedding
+#                similarity against the question and each sub-question) and
+#                fill the budget best-first, adding neighbours. Blocks are kept
+#                or dropped whole; only a block larger than the room left is cut
+#                (first part + figure lines), with a WARNING.
+#   4. render  - original order, grouped under "[Email N: subject]".
+# Every threshold lives in Settings (CHATBOT_CONTEXT_*) and reaches this code
+# through ContextConfig; the constants below are email-boilerplate patterns.
 
-_MIN_SENTENCE_CHARS = 25          # drop anything shorter than this
-_MAX_SENTENCE_CHARS = 400         # cap each kept sentence
-_MIN_SENTENCES_PER_THREAD = 2     # never drop a thread completely
-# A thread with fewer useful body chars than this also draws on its
-# attachment_data (question-matching lines only, capped below).
-_THIN_BODY_CHARS = 300
-# Max chars of attachment_data pulled in for a thin-body thread.
-_ATTACHMENT_FALLBACK_MAX_CHARS = 1500
-# No single thread may occupy more than this fraction of the context budget,
-# so one big email cannot crowd out the others.
-_PER_THREAD_BUDGET_FRACTION = 0.35
-# Table detection: a run of at least _TABLE_MIN_LINES consecutive short lines
-# (or number-heavy rows) of which at least _TABLE_MIN_DIGIT_SHARE carry a digit.
-_TABLE_CELL_MAX_CHARS = 60        # a label/cell line is short
-_TABLE_ROW_MAX_CHARS = 200        # cap on one rendered table row
-_TABLE_MIN_LINES = 6
-_TABLE_MIN_DIGIT_SHARE = 0.3
-_TABLE_MIN_NUMBERS_IN_ROW = 3     # a longer line still counts as a row if it holds this many numbers
-_TABLE_VALUE_MAX_LETTERS = 4      # "1.65%", "12 cr", "FY25" are values; sentences are not
-# Generic words ignored when scoring question overlap: they appear in almost
+# Generic words ignored when matching question words: they appear in almost
 # every business email and give no discriminating signal.
 _GENERIC_WORDS = {
     "q1", "q2", "q3", "q4", "fy", "fy25", "fy26",
@@ -378,29 +390,43 @@ _REPLY_BOUNDARY_RE = re.compile(
     r"^\s*(-{2,}\s*original message\s*-{2,}|on .{3,250}\bwrote:\s*)$",
     re.IGNORECASE,
 )
-# "Sample N" prefix the test corpus injects.
-_SAMPLE_PREFIX_RE = re.compile(r"^\s*sample\s+\d+\s*[:\-.]?\s*", re.IGNORECASE)
-# Sign-offs / signature openers.
-_SIGNATURE_RE = re.compile(
-    r"^\s*(regards|thanks|thank you|best regards|warm regards|kind regards|"
-    r"sincerely|cheers|br|yours (?:faithfully|sincerely)|sent from my)\b",
+# A line that is only a sign-off ("Regards,", "Thanks and regards", "Sent from
+# my ..."). The rest of that paragraph (name, title, phone) is the signature.
+_SIGNOFF_RE = re.compile(
+    r"^\s*(?:(?:(?:best|warm|kind|with)\s+)?(?:regards|thanks|thank you|sincerely|cheers|br"
+    r"|yours (?:faithfully|sincerely))(?:\s*(?:and|&)\s*regards)?\s*[,.!]?"
+    r"|sent from my\b.*)\s*$",
+    re.IGNORECASE,
+)
+# Paragraphs that are legal/confidentiality boilerplate.
+_DISCLAIMER_RE = re.compile(
+    r"\b(disclaimer|confidentiality notice|intended recipient|privileged and confidential)\b",
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+")
-# A short line that is almost entirely an address / phone / disclaimer block.
+# A short line that is almost entirely an address / phone block.
 _ADDRESS_BLOCK_RE = re.compile(
     r"^\s*(tel|phone|mob|mobile|fax|ext|ph|m|t)\s*[:.]?\s*[\d +()\-]{6,}\s*$",
     re.IGNORECASE,
 )
-# Signal tokens: numbers, percentages, amounts, dates.
-_NUMERIC_RE = re.compile(
-    r"\d|%|₹|rs\.?|inr|usd|\$|crore|cr\b|lakh|lac|bps|"
-    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
-    r"january|february|march|april|june|july|august|september|october|"
-    r"november|december|q[1-4]|fy\d|h[12])\b",
-    re.IGNORECASE,
+# Invisible characters and replacement marks that only come from bad decoding.
+_ARTIFACT_RE = re.compile("[﻿​‌‍⁠�]")
+# UTF-8 text that was decoded as cp1252/latin-1: a lead character followed by
+# continuation-looking characters, e.g. an apostrophe turned into three symbols.
+_MOJIBAKE_RE = re.compile(
+    "(?:[Â-ô][\u0080-¿ŒœŠšŸŽž"
+    "ƒˆ˜–—‘-„†-•…‰‹"
+    "›€™]{1,3})+"
 )
+# Bullet / numbered-list markers: "- x", "* x", "• x", "1. x", "2) x", "a) x".
+_BULLET_RE = re.compile(r"^\s*(?:[-*•·–—▪●○◦]|\(?\d{1,3}[.)]|\(?[A-Za-z][.)])\s+")
+# A figure: a digit, a percent sign or a currency mark.
+_FIGURE_RE = re.compile(r"\d|%|[₹$€£¥]")
+_DIGIT_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*")
+# Sub-question separators: commas (not inside numbers), ";", "&", "and" and
+# list numbering such as "1)" / "2.".
+_SUBQ_SPLIT_RE = re.compile(r"\s*(?:,(?=\s|$)|;|&|\band\b|\b\d{1,2}[.)](?=\s))\s*", re.IGNORECASE)
 
 _STOPWORDS = {
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
@@ -416,518 +442,663 @@ _STOPWORDS = {
     "show", "give",
 }
 
+# Gap between blocks when rendered (a blank line); counted against the budget.
+_BLOCK_SEPARATOR = "\n\n"
 
-def _resolve_context_params(
-    budget_chars: int | None,
-    max_threads: int | None,
-    table_fraction: float | None,
-    ignore_words: set[str] | None,
-) -> tuple[int, int, float, set[str]]:
-    """Fill any parameter left as None from Settings (CHATBOT_CONTEXT_*).
 
-    Settings is only consulted when something is missing, so callers (and unit
-    tests) that pass every value explicitly never touch the environment.
+@dataclass(frozen=True)
+class ContextConfig:
+    """Every build_context threshold, resolved from Settings (CHATBOT_CONTEXT_*).
+
+    Built once per request by ``from_settings``; tests construct it directly,
+    so the builder itself never reads the environment.
     """
-    if None in (budget_chars, max_threads, table_fraction, ignore_words):
-        settings = get_settings()
-        if budget_chars is None:
-            budget_chars = settings.chatbot_context_max_chars
-        if max_threads is None:
-            max_threads = settings.chatbot_context_top_threads
-        if table_fraction is None:
-            table_fraction = settings.chatbot_context_table_fraction
-        if ignore_words is None:
-            ignore_words = {
-                w.strip().lower()
-                for w in settings.chatbot_context_ignore_words.split(",")
-                if w.strip()
-            }
-    return (
-        max(1, int(budget_chars)),
-        max(1, int(max_threads)),
-        min(max(float(table_fraction), 0.0), 1.0),
-        ignore_words,
-    )
 
+    max_chars: int              # CHATBOT_CONTEXT_MAX_CHARS
+    top_threads: int            # CHATBOT_CONTEXT_TOP_THREADS
+    neighbor_blocks: int        # CHATBOT_CONTEXT_NEIGHBOR_BLOCKS
+    min_thread_share: float     # CHATBOT_CONTEXT_MIN_THREAD_SHARE
+    figure_bonus: float         # CHATBOT_CONTEXT_FIGURE_BONUS
+    use_embeddings: bool        # CHATBOT_CONTEXT_USE_EMBEDDINGS
+    embedding_weight: float     # CHATBOT_CONTEXT_EMBEDDING_WEIGHT
+    dedup_similarity: float     # CHATBOT_CONTEXT_DEDUP_SIMILARITY
+    dedup_min_chars: int        # CHATBOT_CONTEXT_DEDUP_MIN_CHARS
+    short_line_chars: int       # CHATBOT_CONTEXT_SHORT_LINE_CHARS
+    table_min_lines: int        # CHATBOT_CONTEXT_TABLE_MIN_LINES
+    table_min_numbers: int      # CHATBOT_CONTEXT_TABLE_MIN_NUMBERS
+    block_max_chars: int        # CHATBOT_CONTEXT_BLOCK_MAX_CHARS
+    partial_head_share: float   # CHATBOT_CONTEXT_PARTIAL_HEAD_SHARE
+    thin_body_chars: int        # CHATBOT_CONTEXT_THIN_BODY_CHARS
+    attachment_max_chars: int   # CHATBOT_CONTEXT_ATTACHMENT_MAX_CHARS
+    ignore_words: frozenset = frozenset()   # CHATBOT_CONTEXT_IGNORE_WORDS
+
+    @classmethod
+    def from_settings(cls, settings=None) -> "ContextConfig":
+        s = settings or get_settings()
+        return cls(
+            max_chars=s.chatbot_context_max_chars,
+            top_threads=s.chatbot_context_top_threads,
+            neighbor_blocks=s.chatbot_context_neighbor_blocks,
+            min_thread_share=s.chatbot_context_min_thread_share,
+            figure_bonus=s.chatbot_context_figure_bonus,
+            use_embeddings=s.chatbot_context_use_embeddings,
+            embedding_weight=s.chatbot_context_embedding_weight,
+            dedup_similarity=s.chatbot_context_dedup_similarity,
+            dedup_min_chars=s.chatbot_context_dedup_min_chars,
+            short_line_chars=s.chatbot_context_short_line_chars,
+            table_min_lines=s.chatbot_context_table_min_lines,
+            table_min_numbers=s.chatbot_context_table_min_numbers,
+            block_max_chars=s.chatbot_context_block_max_chars,
+            partial_head_share=s.chatbot_context_partial_head_share,
+            thin_body_chars=s.chatbot_context_thin_body_chars,
+            attachment_max_chars=s.chatbot_context_attachment_max_chars,
+            ignore_words=frozenset(
+                w.strip().lower()
+                for w in s.chatbot_context_ignore_words.split(",")
+                if w.strip()
+            ),
+        )
+
+
+@dataclass
+class _Block:
+    """One atomic unit of a cleaned thread: kept whole or dropped whole."""
+
+    kind: str                   # "prose" | "bullets" | "table"
+    lines: list
+    pos: int = 0                # position within its thread, after dedup
+    score: float = 0.0
+    must: bool = False          # best match for the question or a sub-question
+    tier: int = 3               # fill order: 1 best match/table, 2 neighbour, 3 rest
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    @property
+    def chars(self) -> int:
+        return len(self.text)
+
+    @property
+    def has_figures(self) -> bool:
+        return _FIGURE_RE.search(self.text) is not None
+
+
+# ── Step 1: lossless cleaning ─────────────────────────────────
 
 def _thread_body(chunk: dict) -> str:
     """Return ONLY the thread's own subject-free body text.
 
-    Per spec build_context must use each thread's ``subject`` and ``body``
-    only - never thread_raw_content, messages_json, metadata_summary,
-    attachment_data, or any id field.
+    build_context uses each thread's ``subject`` and ``body`` only - never
+    thread_raw_content, messages_json, metadata_summary or any id field.
+    attachment_data is consulted separately and only for a thin body.
     """
     return str(chunk.get("body") or "").strip()
 
 
-def _split_sentences(text: str) -> list[str]:
-    """Split a body into candidate sentences/lines.
+def _fix_encoding(text: str) -> str:
+    """Remove decoding artifacts and repair UTF-8 that was read as cp1252/latin-1.
 
-    Split on newlines first (emails are line-oriented), then on sentence
-    terminators so long paragraphs become individual sentences.
+    Only runs that decode cleanly are rewritten; anything else is untouched.
     """
-    pieces: list[str] = []
-    for line in text.splitlines():
-        line = line.strip()
+    text = _ARTIFACT_RE.sub("", text)
+
+    def _repair(match: re.Match) -> str:
+        raw = match.group(0)
+        for enc in ("cp1252", "latin-1"):
+            try:
+                return raw.encode(enc).decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+        return raw
+
+    return _MOJIBAKE_RE.sub(_repair, text)
+
+
+def _is_boilerplate_line(line: str) -> bool:
+    """Address/phone block, url, or a line that is mostly an email address."""
+    if _ADDRESS_BLOCK_RE.match(line) or _URL_RE.search(line):
+        return True
+    return bool(_EMAIL_RE.search(line)) and len(_EMAIL_RE.sub("", line).strip()) < 15
+
+
+def _clean_paragraphs(text: str, cfg: ContextConfig) -> list[list[str]]:
+    """Return the paragraphs (lists of lines) left after removing headers,
+    reply boundaries, separators, signatures, address/url lines and disclaimer
+    paragraphs. Remaining lines are kept as written (only trimmed at the ends).
+    """
+    paragraphs: list[list[str]] = []
+    current: list[str] = []
+    in_signature = False
+
+    def flush() -> None:
+        nonlocal current
+        if current and not _DISCLAIMER_RE.search(" ".join(current)):
+            paragraphs.append(current)
+        current = []
+
+    for raw in _fix_encoding(text).splitlines():
+        line = raw.strip()
         if not line:
+            flush()
+            in_signature = False
             continue
-        # Split a line further on sentence boundaries (. ! ?) followed by space.
-        for part in re.split(r"(?<=[.!?])\s+", line):
-            part = part.strip()
-            if part:
-                pieces.append(part)
-    return pieces
+        if _REPLY_BOUNDARY_RE.match(line) or _HEADER_LINE_RE.match(line) or _SEPARATOR_RE.match(line):
+            in_signature = False
+            continue
+        if in_signature:
+            continue
+        if len(line) <= cfg.short_line_chars and _SIGNOFF_RE.match(line):
+            in_signature = True
+            continue
+        if _is_boilerplate_line(line):
+            continue
+        current.append(line)
+    flush()
+    return paragraphs
 
 
-def _is_noise(sentence: str) -> bool:
-    """True if a sentence is a header/separator/signature/address/url/noise line."""
-    s = sentence.strip()
-    if not s:
-        return True
-    if _HEADER_LINE_RE.match(s):
-        return True
-    if _SEPARATOR_RE.match(s):
-        return True
-    if _REPLY_BOUNDARY_RE.match(s):
-        return True
-    if _SIGNATURE_RE.match(s):
-        return True
-    if _ADDRESS_BLOCK_RE.match(s):
-        return True
-    if _URL_RE.search(s):
-        return True
-    # A line that is mostly an email address with little else.
-    if _EMAIL_RE.search(s) and len(_EMAIL_RE.sub("", s).strip()) < 15:
-        return True
-    return False
+# ── Step 2: block formation ───────────────────────────────────
+
+def _ends_sentence(line: str) -> bool:
+    """True for a line that closes a sentence (., ! or ?) - prose, not a table cell."""
+    return line.rstrip().endswith((".", "!", "?"))
 
 
-def _clean_sentence(sentence: str) -> str:
-    """Strip the 'Sample N' prefix and cap the sentence length."""
-    s = _SAMPLE_PREFIX_RE.sub("", sentence).strip()
-    if len(s) > _MAX_SENTENCE_CHARS:
-        s = s[:_MAX_SENTENCE_CHARS].rstrip()
-    return s
+def _line_kind(line: str, cfg: ContextConfig) -> str:
+    """B: bullet/numbered line. T: table-like (short, delimited, or number-heavy).
+    P: ordinary prose."""
+    if _BULLET_RE.match(line):
+        return "B"
+    if (
+        len(line) <= cfg.short_line_chars
+        or "|" in line
+        or "\t" in line
+        or len(_DIGIT_TOKEN_RE.findall(line)) >= cfg.table_min_numbers
+    ):
+        return "T"
+    return "P"
 
 
-def _normalise_key(sentence: str) -> str:
-    """Normalise a sentence for cross-thread dedup: lowercase, alnum only."""
-    return re.sub(r"[^a-z0-9]+", "", sentence.lower())
+def _split_oversize(lines: list[str], cfg: ContextConfig) -> list[list[str]]:
+    """Split a long prose block at line boundaries into chunks of at most
+    block_max_chars. A split is only allowed before an ordinary prose line and
+    never after a line ending in ":", so short value lines stay with the line
+    above them."""
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    size = 0
+    for line in lines:
+        splittable = current and _line_kind(line, cfg) == "P" and not current[-1].endswith(":")
+        if splittable and size + len(line) + 1 > cfg.block_max_chars:
+            chunks.append(current)
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        chunks.append(current)
+    return chunks
 
 
-def _question_words(question: str, ignore_words: set[str] | None = None) -> set[str]:
+def _form_blocks(paragraphs: list[list[str]], cfg: ContextConfig) -> list[_Block]:
+    """Group cleaned paragraphs into atomic blocks.
+
+    * adjacent table-like lines form one table block; across a blank line they
+      still join when neither line ends a sentence (cells are often separated
+      by blank lines, sentences are not); consecutive bullet lines form one
+      bullet block
+    * a table-like run shorter than table_min_lines continues the block above it
+      (same paragraph, or that block's last line does not end a sentence) or
+      prefixes the block below it (same paragraph), so a lone value line never
+      becomes a block of its own; otherwise it stands alone
+    * prose lines of one paragraph form one block, split only when longer than
+      block_max_chars (see _split_oversize)
+    * a line ending in ":" introduces the block that follows it and moves into it
+    """
+    runs: list[dict] = []
+    for p_idx, para in enumerate(paragraphs):
+        for line in para:
+            kind = _line_kind(line, cfg)
+            last = runs[-1] if runs else None
+            joins = bool(last) and last["kind"] == kind and (
+                last["last_para"] == p_idx
+                or kind == "B"
+                or (kind == "T" and not _ends_sentence(last["lines"][-1]) and not _ends_sentence(line))
+            )
+            if joins:
+                last["lines"].append(line)
+                last["last_para"] = p_idx
+            else:
+                runs.append({"kind": kind, "lines": [line], "first_para": p_idx, "last_para": p_idx})
+
+    blocks: list[_Block] = []
+    block_last_para: list[int] = []
+    prefix: list[str] = []
+    for i, run in enumerate(runs):
+        if run["kind"] == "T" and len(run["lines"]) < cfg.table_min_lines:
+            if blocks and (
+                block_last_para[-1] == run["first_para"] or not _ends_sentence(blocks[-1].lines[-1])
+            ):
+                blocks[-1].lines.extend(run["lines"])
+                block_last_para[-1] = run["last_para"]
+                continue
+            following = runs[i + 1] if i + 1 < len(runs) else None
+            if following is not None and following["first_para"] == run["last_para"]:
+                prefix = run["lines"]
+                continue
+            blocks.append(_Block(kind="prose", lines=run["lines"]))
+            block_last_para.append(run["last_para"])
+            continue
+        kind = {"T": "table", "B": "bullets", "P": "prose"}[run["kind"]]
+        blocks.append(_Block(kind=kind, lines=prefix + run["lines"]))
+        block_last_para.append(run["last_para"])
+        prefix = []
+
+    # An introducing line ("... :") moves down into the block it introduces.
+    for i in range(len(blocks) - 1):
+        prev, nxt = blocks[i], blocks[i + 1]
+        if prev.lines and prev.lines[-1].endswith(":"):
+            nxt.lines.insert(0, prev.lines.pop())
+    blocks = [b for b in blocks if b.lines]
+
+    out: list[_Block] = []
+    for block in blocks:
+        if block.kind == "prose" and block.chars > cfg.block_max_chars:
+            out.extend(_Block(kind="prose", lines=chunk) for chunk in _split_oversize(block.lines, cfg))
+        else:
+            out.append(block)
+    return out
+
+
+def _question_words(question: str, ignore_words=frozenset()) -> set[str]:
     """Significant (non-stopword, non-generic) words from the question, lowercased.
 
-    Generic business words (q1-q4, fy, fy25/fy26, actuals, data, please, find,
-    below), question phrasing (much, many, percentage ...) and any configured
-    ``ignore_words`` (CHATBOT_CONTEXT_IGNORE_WORDS) are dropped too: they give
-    no discriminating signal for thread/sentence scoring.
+    Generic business words, question phrasing (much, many, percentage ...) and
+    any configured ``ignore_words`` (CHATBOT_CONTEXT_IGNORE_WORDS) are dropped:
+    they give no discriminating signal for matching.
     """
-    ignored = ignore_words or set()
     words = re.findall(r"\w+", (question or "").lower())
     return {
         w for w in words
-        if w not in _STOPWORDS and w not in _GENERIC_WORDS and w not in ignored
+        if w not in _STOPWORDS and w not in _GENERIC_WORDS and w not in ignore_words
         and len(w) > 1
     }
 
 
-def _score_sentence(sentence: str, q_words: set[str]) -> float:
-    """Overlap score between a sentence and the question words.
+def _prepare_thread(chunk: dict, q_words: set[str], cfg: ContextConfig) -> dict:
+    """Clean one thread and split it into blocks.
 
-    Each distinct question word present scores 1; a small bonus is added for
-    sentences carrying numeric/date/amount signal so figures are preferred
-    when overlap ties.
+    A thin body (< thin_body_chars after cleaning) also draws question-matching
+    blocks from attachment_data, up to attachment_max_chars in total.
     """
+    raw_body = _thread_body(chunk)
+    blocks = _form_blocks(_clean_paragraphs(raw_body, cfg), cfg)
+
+    if sum(b.chars for b in blocks) < cfg.thin_body_chars and q_words:
+        attachment = str(chunk.get("attachment_data") or "").strip()
+        used = 0
+        for block in _form_blocks(_clean_paragraphs(attachment, cfg), cfg):
+            if not (q_words & set(re.findall(r"\w+", block.text.lower()))):
+                continue
+            if used + block.chars > cfg.attachment_max_chars:
+                break
+            blocks.append(block)
+            used += block.chars
+
+    return {
+        "subject": chunk.get("subject") or "(no subject)",
+        "blocks": blocks,
+        "raw_chars": len(raw_body),
+    }
+
+
+def _has_keyword_match(prepared: dict, q_words: set[str]) -> bool:
+    """A real keyword match: a question word occurs in the subject or a block."""
     if not q_words:
-        base = 0.0
-    else:
-        s_words = set(re.findall(r"\w+", sentence.lower()))
-        base = float(len(q_words & s_words))
-    if _NUMERIC_RE.search(sentence):
-        base += 0.5
-    return base
-
-
-def _has_numeric(sentence: str) -> bool:
-    """True if the sentence contains a number, date, percentage or amount."""
-    return bool(_NUMERIC_RE.search(sentence))
-
-
-def _attachment_fallback_sentences(chunk: dict, q_words: set[str]) -> list[str]:
-    """Return cleaned attachment_data lines that match the question words.
-
-    Used only when a thread's body is thin (< _THIN_BODY_CHARS useful chars).
-    Keeps only lines overlapping the (generic-filtered) question words, applies
-    the same noise/length/clean rules as the body, and caps the total at
-    _ATTACHMENT_FALLBACK_MAX_CHARS per thread.
-    """
-    attachment = str(chunk.get("attachment_data") or "").strip()
-    if not attachment or not q_words:
-        return []
-
-    picked: list[str] = []
-    used = 0
-    for sent in _split_sentences(attachment):
-        if _is_noise(sent):
-            continue
-        cleaned = _clean_sentence(sent)
-        if len(cleaned) < _MIN_SENTENCE_CHARS:
-            continue
-        s_words = set(re.findall(r"\w+", cleaned.lower()))
-        if not (q_words & s_words):
-            continue
-        if used + len(cleaned) > _ATTACHMENT_FALLBACK_MAX_CHARS:
-            break
-        picked.append(cleaned)
-        used += len(cleaned)
-    return picked
-
-
-_DIGIT_GROUP_RE = re.compile(r"\d+(?:[.,]\d+)?")
-
-
-def _is_table_line(line: str) -> bool:
-    """True for a line that can belong to a table: a short label/value cell, or
-    a longer row holding several numbers. Header/signature/url noise is not."""
-    if _is_noise(line):
-        return False
-    if len(line) <= _TABLE_CELL_MAX_CHARS:
         return True
-    return (
-        len(line) <= _TABLE_ROW_MAX_CHARS
-        and len(_DIGIT_GROUP_RE.findall(line)) >= _TABLE_MIN_NUMBERS_IN_ROW
-    )
+    words = set(re.findall(r"\w+", prepared["subject"].lower()))
+    for block in prepared["blocks"]:
+        words |= set(re.findall(r"\w+", block.text.lower()))
+    return bool(q_words & words)
 
 
-def _looks_like_table(run: list[str]) -> bool:
-    """A table is a long enough run of table-like lines with enough numbers."""
-    if len(run) < _TABLE_MIN_LINES:
-        return False
-    with_digit = sum(1 for line in run if re.search(r"\d", line))
-    return with_digit / len(run) >= _TABLE_MIN_DIGIT_SHARE
+def _dedup_blocks(selected: list[dict], cfg: ContextConfig) -> int:
+    """Drop blocks that repeat an earlier block (quoted history), within a
+    thread and across the threads being sent. Returns how many were dropped.
 
-
-def _is_value_line(line: str) -> bool:
-    """A mostly-numeric cell such as '1.65%', '12 cr' or 'FY25'."""
-    return bool(re.search(r"\d", line)) and len(re.findall(r"[A-Za-z]", line)) <= _TABLE_VALUE_MAX_LETTERS
-
-
-def _table_rows(run: list[str]) -> list[str]:
-    """Join a table's lines into rows: a label line followed by value line(s)
-    becomes ``label: v1 | v2``; any other line is kept as its own row."""
-    rows: list[str] = []
-    label: str | None = None
-    values: list[str] = []
-
-    def flush() -> None:
-        nonlocal label, values
-        if label is not None:
-            rows.append(f"{label}: {' | '.join(values)}" if values else label)
-        label, values = None, []
-
-    for line in run:
-        if _is_value_line(line):
-            if label is None:
-                rows.append(line)
-            else:
-                values.append(line)
-        else:
-            flush()
-            label = line
-    flush()
-    return [row[:_TABLE_ROW_MAX_CHARS] for row in rows]
-
-
-def _extract_tables(body: str) -> tuple[str, list[str]]:
-    """Split a body into (prose text, table rows).
-
-    Table rows bypass the noise filter, the minimum-length rule, dedup and
-    scoring (see build_context); everything else is returned as prose.
+    A block repeats an earlier one when its words match exactly, or match at
+    dedup_similarity or better AND carry exactly the same figures - an updated
+    figure is new information, never a repeat. Blocks shorter than
+    dedup_min_chars are never treated as repeats.
     """
-    prose: list[str] = []
-    rows: list[str] = []
-    run: list[str] = []
-    blanks = 0
+    seen: list[tuple[set, set]] = []
+    removed = 0
+    for prepared in selected:
+        kept: list[_Block] = []
+        for block in prepared["blocks"]:
+            if block.chars < cfg.dedup_min_chars:
+                kept.append(block)
+                continue
+            words = set(re.findall(r"\w+", block.text.lower()))
+            if not words:
+                kept.append(block)
+                continue
+            figures = {w for w in words if any(c.isdigit() for c in w)}
+            duplicate = any(
+                figures == old_figures
+                and len(words & old_words) / len(words | old_words) >= cfg.dedup_similarity
+                for old_words, old_figures in seen
+            )
+            if duplicate:
+                removed += 1
+                continue
+            seen.append((words, figures))
+            kept.append(block)
+        prepared["blocks"] = kept
+    return removed
 
-    def close() -> None:
-        nonlocal run
-        if _looks_like_table(run):
-            rows.extend(_table_rows(run))
+
+# ── Step 3: selection ─────────────────────────────────────────
+
+def _sub_questions(question: str, ignore_words) -> list[str]:
+    """The whole question first, then each part of a multi-part question
+    (split on commas, ';', '&', 'and' and numbering) that still has
+    significant words of its own."""
+    queries = [question]
+    parts = [p.strip() for p in _SUBQ_SPLIT_RE.split(question or "") if p and p.strip()]
+    if len(parts) > 1:
+        for part in parts:
+            if _question_words(part, ignore_words) and part not in queries:
+                queries.append(part)
+    return queries
+
+
+def _score_blocks(blocks: list[_Block], queries: list[str], cfg: ContextConfig, stats: dict) -> None:
+    """Set each block's score and mark the best block for every query.
+
+    Hybrid score per (query, block): BM25 (built over this request's blocks,
+    normalised to 0-1 per query) blended with embedding similarity when
+    CHATBOT_CONTEXT_USE_EMBEDDINGS is on. A block's score is its best hybrid
+    score over the whole question and every sub-question, plus figure_bonus
+    when it contains figures. An embedding failure falls back to BM25 only.
+    """
+    from rank_bm25 import BM25Okapi
+
+    from chatbot.bm25_index import _tokenise
+
+    docs = [_tokenise(b.text) for b in blocks]
+    bm25 = BM25Okapi(docs) if any(docs) else None
+
+    sims = None
+    if cfg.use_embeddings:
+        try:
+            vectors = embed_texts(queries + [b.text[: cfg.block_max_chars] for b in blocks])
+            sims = np.clip(vectors[len(queries):] @ vectors[: len(queries)].T, 0.0, None)  # (blocks, queries)
+            stats["embeddings"] = "on"
+        except Exception as e:  # embedding is an enhancement, never a requirement
+            logger.warning("build_context: embedding failed (%s) - ranking blocks with BM25 only", e)
+            stats["embeddings"] = "failed"
+    else:
+        stats["embeddings"] = "off"
+
+    best_per_query = [(-1.0, -1)] * len(queries)
+    for q_idx, query in enumerate(queries):
+        if bm25 is not None and (tokens := _tokenise(query)):
+            raw = np.clip(np.asarray(bm25.get_scores(tokens), dtype=float), 0.0, None)
+            bm_norm = raw / raw.max() if raw.max() > 0 else raw
         else:
-            prose.extend(run)
-        run = []
+            bm_norm = np.zeros(len(blocks))
+        for b_idx, block in enumerate(blocks):
+            hybrid = float(bm_norm[b_idx])
+            if sims is not None:
+                hybrid = (1.0 - cfg.embedding_weight) * hybrid + cfg.embedding_weight * float(sims[b_idx, q_idx])
+            block.score = max(block.score, hybrid)
+            if hybrid > best_per_query[q_idx][0]:
+                best_per_query[q_idx] = (hybrid, b_idx)
 
-    for raw in body.splitlines():
-        line = raw.strip()
-        if not line:
-            blanks += 1
-            if blanks >= 2:
-                close()
+    for block in blocks:
+        if block.has_figures:
+            block.score += cfg.figure_bonus
+    for _score, b_idx in best_per_query:
+        if b_idx >= 0:
+            blocks[b_idx].must = True
+
+
+def _line_units(lines: list[str]) -> list[list[int]]:
+    """Group line indexes so a label line is never separated from the figure
+    lines directly below it: [label, value, value...], or a lone line."""
+    units: list[list[int]] = []
+    i = 0
+    while i < len(lines):
+        unit = [i]
+        i += 1
+        if _FIGURE_RE.search(lines[unit[0]]) is None:
+            while i < len(lines) and _FIGURE_RE.search(lines[i]):
+                unit.append(i)
+                i += 1
+        units.append(unit)
+    return units
+
+
+def _partial_lines(lines: list[str], space: int, cfg: ContextConfig) -> list[str]:
+    """Last resort for a block larger than the room left: keep its first part
+    (up to partial_head_share of the room), then add the units that contain
+    figures while they fit. Units keep a label with its value lines; only a
+    single first line longer than the room is cut mid-line."""
+    units = _line_units(lines)
+    size = lambda unit: sum(len(lines[i]) + 1 for i in unit)  # noqa: E731
+    keep: set[int] = set()
+    used = 0
+    head_room = int(space * cfg.partial_head_share)
+    for unit in units:
+        if keep and used + size(unit) > head_room:
+            break
+        if not keep and size(unit) > space:
+            return [lines[unit[0]][: max(1, space)]]
+        keep.update(unit)
+        used += size(unit)
+    for unit in units:
+        if keep.issuperset(unit) or not any(_FIGURE_RE.search(lines[i]) for i in unit):
             continue
-        blanks = 0
-        if _is_table_line(line):
-            run.append(line)
-        else:
-            close()
-            prose.append(line)
-    close()
-    return "\n".join(prose), rows
+        if used + size(unit) <= space:
+            keep.update(unit)
+            used += size(unit)
+    return [lines[i] for i in sorted(keep)]
 
+
+def _select_blocks(selected: list[dict], queries: list[str], cfg: ContextConfig, budget: int, stats: dict) -> list[dict]:
+    """Choose blocks for every thread being sent. Returns, per thread, a dict
+    {block_pos: None (whole block) | list of lines (partial)}."""
+    n = len(selected)
+    flat = [(t, b) for t, p in enumerate(selected) for b in p["blocks"]]
+    _score_blocks([b for _t, b in flat], queries, cfg, stats)
+
+    overhead = [len(f"[Email {t + 1}: {p['subject']}]") + 1 for t, p in enumerate(selected)]
+    usable = max(1, budget - sum(overhead) - len(_BLOCK_SEPARATOR) * (n - 1))
+
+    # Budget share per thread: proportional to its best block score, but never
+    # below min_thread_share, so no thread is dropped completely.
+    relevance = [max((b.score for b in p["blocks"]), default=0.0) for p in selected]
+    total = sum(relevance)
+    min_share = min(cfg.min_thread_share, 1.0 / n)
+    shares = [max(r / total if total > 0 else 1.0 / n, min_share) for r in relevance]
+    caps = [int(usable * s / sum(shares)) for s in shares]
+
+    chosen: list[dict] = [{} for _ in range(n)]
+    used_by = [0] * n
+    used = 0
+    gap = len(_BLOCK_SEPARATOR)
+
+    def try_add(t: int, block: _Block, use_caps: bool) -> bool:
+        nonlocal used
+        cost = block.chars + gap
+        if block.pos in chosen[t] or used + cost > usable:
+            return False
+        if use_caps and used_by[t] + cost > caps[t]:
+            return False
+        chosen[t][block.pos] = None
+        used += cost
+        used_by[t] += cost
+        return True
+
+    def by_score(items):
+        return sorted(items, key=lambda tb: -tb[1].score)
+
+    def keep_partial(t: int, block: _Block, space: int, why: str) -> None:
+        nonlocal used
+        if space <= 0:
+            logger.warning(
+                "build_context: no room for block %d (%s) of thread %r - dropped whole (%s)",
+                block.pos + 1, block.kind, selected[t]["subject"], why,
+            )
+            return
+        lines = _partial_lines(block.lines, space, cfg)
+        cost = sum(len(line) + 1 for line in lines) + gap
+        chosen[t][block.pos] = lines
+        used += cost
+        used_by[t] += cost
+        stats["cuts"].append({
+            "subject": selected[t]["subject"], "block": block.pos + 1, "kind": block.kind,
+            "lines_kept": len(lines), "lines_total": len(block.lines),
+            "chars_cut": max(0, block.chars - sum(len(line) + 1 for line in lines)),
+        })
+        logger.warning(
+            "build_context: block %d (%s) of thread %r is larger than the room left (%s) - "
+            "kept %d of %d lines (first part + figure lines), cut %d chars",
+            block.pos + 1, block.kind, selected[t]["subject"], why,
+            len(lines), len(block.lines), stats["cuts"][-1]["chars_cut"],
+        )
+
+    # Tier 1: the best block for the question and each sub-question, then tables.
+    for _t, b in flat:
+        b.tier = 1 if (b.must or b.kind == "table") else 3
+    tier1 = by_score([x for x in flat if x[1].must]) + by_score(
+        [x for x in flat if x[1].kind == "table" and not x[1].must]
+    )
+    too_big = [(t, b) for t, b in tier1 if not try_add(t, b, True) and b.must]
+    for t, b in too_big:  # Step 3f, right away so lower tiers cannot use up the room
+        keep_partial(t, b, min(usable - used, caps[t] - used_by[t]), "best match for the question")
+
+    # Tier 2: neighbours of the blocks kept so far (labels and context come along).
+    neighbours: list[tuple[int, _Block]] = []
+    for t, b in by_score([x for x in tier1 if x[1].pos in chosen[x[0]]]):
+        blocks = selected[t]["blocks"]
+        for step in range(1, cfg.neighbor_blocks + 1):
+            for pos in (b.pos - step, b.pos + step):
+                if 0 <= pos < len(blocks) and pos not in chosen[t] and (t, blocks[pos]) not in neighbours:
+                    neighbours.append((t, blocks[pos]))
+    for t, b in neighbours:
+        if try_add(t, b, True):
+            b.tier = 2
+
+    # Tier 3: everything else by score; then use any room the shares left over.
+    for use_caps in (True, False):
+        for t, b in by_score([x for x in flat if x[1].pos not in chosen[x[0]]]):
+            try_add(t, b, use_caps)
+
+    # A thread being sent is never left with nothing.
+    for t, p in enumerate(selected):
+        if not chosen[t] and p["blocks"]:
+            best = max(p["blocks"], key=lambda blk: blk.score)
+            keep_partial(t, best, max(1, caps[t]), "thread would otherwise be empty")
+    return chosen
+
+
+# ── Step 4: render ────────────────────────────────────────────
 
 def build_context(
     threads: list[dict],
     question: str,
-    budget_chars: int | None = None,
+    cfg: ContextConfig | None = None,
     stats: dict | None = None,
-    max_threads: int | None = None,
-    table_fraction: float | None = None,
-    ignore_words: set[str] | None = None,
+    budget_chars: int | None = None,
 ) -> str:
-    """Build a compact, deduplicated, question-relevant context string.
+    """Build the context string sent to the LLM from the retrieved threads.
 
-    Sends at most ``max_threads`` threads (best-ranked first) and only those
-    that share a real keyword with the question; their best-scoring,
-    deduplicated sentences plus protected table rows are grouped under
-    ``[Email N: subject]`` with N counting the threads actually sent.
-    Parameters left as None come from Settings (CHATBOT_CONTEXT_MAX_CHARS,
-    CHATBOT_CONTEXT_TOP_THREADS, CHATBOT_CONTEXT_TABLE_FRACTION,
-    CHATBOT_CONTEXT_IGNORE_WORDS).
+    Uses at most ``cfg.top_threads`` threads (best-ranked first) that share a
+    real keyword with the question. Their cleaned blocks are sent unchanged
+    when they all fit ``budget_chars`` (default ``cfg.max_chars``), otherwise
+    the best blocks are selected (see the module notes above). Output is in
+    original order under ``[Email N: subject]`` (N counts the threads sent).
 
-    Rules implemented:
-      * subject + body; never raw/messages_json/metadata/ids. A thread with a
-        thin body (< 300 useful chars) also draws question-matching lines from
-        its attachment_data, capped at 1500 chars for that thread
-      * table rows (runs of short label/value lines or number-heavy rows) are
-        joined as "label: value" and are NEVER dropped by the noise filter, the
-        25-char minimum, dedup or scoring. They have their own budget
-        (table_fraction of budget_chars); rows beyond it are cut from the end of
-        the table and a WARNING naming the thread subject is logged
-      * drop lines < 25 chars and header/separator/signature/address/url noise
-        from the prose
-      * dedup prose sentences across ALL threads (normalise lower + alnum)
-      * score by question-word overlap (+ numeric bonus), ignoring generic and
-        question words and configured ignore words
-      * a thread has a real keyword match when a question word occurs in one of
-        its sentences, its subject or its table rows; threads without one are
-        dropped (skipped when the question has no significant words)
-      * keep best prose sentences until the remaining budget; cap each sentence
-        at 400 chars and each thread's prose at 35% of the budget
-      * re-order kept sentences into original thread order
-      * every sent thread gets >= 1 line: the top sentences by score, or, if the
-        budget is already spent, its single best sentence (a small overshoot)
-      * keep a numeric/date sentence that sits next to a kept sentence
-
-    If ``stats`` (a dict) is passed, it is populated with diagnostics:
-      stats["kept_per_thread"] = [(rank, subject, kept_count), ...]  (one tuple
-          per input thread, in retrieval order)
-      stats["threads_in"], stats["threads_used"]
-      stats["table_rows_kept"], stats["table_rows_cut"]
-    The returned context string is unaffected.
+    ``stats`` (a dict), when given, is filled for logging and the debug dump:
+      mode ("everything_fit" | "selection"), threads_in, threads_used,
+      blocks_total, blocks_kept, chars_raw / chars_cleaned / chars_sent,
+      dedup_removed, embeddings ("off" | "on" | "failed" | "skipped"),
+      cuts [{subject, block, kind, lines_kept, lines_total, chars_cut}],
+      kept_per_thread [(rank, subject, blocks_kept, blocks_total)],
+      chosen [{rank, subject, blocks: [{pos, kind, chars, tier, score, partial}]}]
     """
-    n_in = len(threads)
+    cfg = cfg or ContextConfig.from_settings()
+    budget = max(1, int(budget_chars if budget_chars is not None else cfg.max_chars))
+    stats = stats if stats is not None else {}
+    stats.update(
+        mode="selection", threads_in=len(threads), threads_used=0, blocks_total=0,
+        blocks_kept=0, chars_raw=0, chars_cleaned=0, chars_sent=0, dedup_removed=0,
+        embeddings="skipped", cuts=[], kept_per_thread=[], chosen=[],
+    )
+    empty = "(no relevant emails found)"
     if not threads:
-        if stats is not None:
-            stats.update(
-                kept_per_thread=[], threads_in=0, threads_used=0,
-                table_rows_kept=0, table_rows_cut=0,
-            )
-        return "(no relevant emails found)"
+        return empty
 
-    budget, max_threads, table_fraction, ignore_words = _resolve_context_params(
-        budget_chars, max_threads, table_fraction, ignore_words,
+    q_words = _question_words(question, cfg.ignore_words)
+    prepared = [_prepare_thread(chunk, q_words, cfg) for chunk in threads]
+    for rank, p in enumerate(prepared, 1):
+        p["rank"] = rank
+
+    selected = [p for p in prepared if _has_keyword_match(p, q_words)][: max(1, cfg.top_threads)]
+    stats["chars_raw"] = sum(p["raw_chars"] for p in selected)
+    stats["dedup_removed"] = _dedup_blocks(selected, cfg)
+    selected = [p for p in selected if p["blocks"]]
+    for p in selected:
+        for pos, block in enumerate(p["blocks"]):
+            block.pos = pos
+    if not selected:
+        return empty
+
+    stats["blocks_total"] = sum(len(p["blocks"]) for p in selected)
+    stats["chars_cleaned"] = sum(b.chars for p in selected for b in p["blocks"])
+
+    headers = [f"[Email {t + 1}: {p['subject']}]" for t, p in enumerate(selected)]
+    everything = len(_BLOCK_SEPARATOR) * (len(selected) - 1) + sum(
+        len(h) + 1 + sum(b.chars for b in p["blocks"]) + len(_BLOCK_SEPARATOR) * (len(p["blocks"]) - 1)
+        for h, p in zip(headers, selected)
     )
-    q_words = _question_words(question, ignore_words)
 
-    # ── Per-thread extraction (preserving original order) ──
-    # thread_sentences[t] = list of (orig_index, cleaned_sentence, score, norm_key)
-    thread_sentences: list[list[tuple]] = []
-    thread_tables: list[list[str]] = []
-    thread_fallback: list[list[str]] = []
-    for chunk in threads:
-        sentences: list[tuple] = []
+    if everything <= budget:
+        stats["mode"] = "everything_fit"
+        chosen: list[dict] = [{b.pos: None for b in p["blocks"]} for p in selected]
+    else:
+        queries = _sub_questions(question, cfg.ignore_words)
+        chosen = _select_blocks(selected, queries, cfg, budget, stats)
 
-        def _append(text: str) -> None:
-            cleaned = _clean_sentence(text)
-            if len(cleaned) < _MIN_SENTENCE_CHARS:
-                return
-            key = _normalise_key(cleaned)
-            if not key:
-                return
-            sentences.append((len(sentences), cleaned, _score_sentence(cleaned, q_words), key))
-
-        prose, table_rows = _extract_tables(_thread_body(chunk))
-
-        body_useful_chars = 0
-        for sent in _split_sentences(prose):
-            if _is_noise(sent):
+    parts: list[str] = []
+    for t, (header, p) in enumerate(zip(headers, selected)):
+        texts, detail = [], []
+        for block in p["blocks"]:
+            if block.pos not in chosen[t]:
                 continue
-            before = len(sentences)
-            _append(sent)
-            if len(sentences) > before:
-                body_useful_chars += len(sentences[-1][1])
+            partial = chosen[t][block.pos]
+            texts.append(block.text if partial is None else "\n".join(partial))
+            detail.append({
+                "pos": block.pos + 1, "kind": block.kind, "chars": block.chars,
+                "tier": block.tier, "score": round(block.score, 3), "partial": partial is not None,
+            })
+        stats["kept_per_thread"].append((p["rank"], p["subject"], len(texts), len(p["blocks"])))
+        stats["chosen"].append({"rank": p["rank"], "subject": p["subject"], "blocks": detail})
+        stats["blocks_kept"] += len(texts)
+        if texts:
+            parts.append(header + "\n" + _BLOCK_SEPARATOR.join(texts))
 
-        # Thin body: supplement with question-matching attachment_data lines.
-        if body_useful_chars < _THIN_BODY_CHARS:
-            for line in _attachment_fallback_sentences(chunk, q_words):
-                _append(line)
-
-        thread_sentences.append(sentences)
-        thread_tables.append(table_rows)
-        # Last-resort lines (ignoring the length rule) for a sent thread that
-        # would otherwise end up with nothing.
-        thread_fallback.append(
-            [_clean_sentence(p) for p in _split_sentences(prose) if not _is_noise(p)][:_MIN_SENTENCES_PER_THREAD]
-        )
-
-    # ── Choose the threads to send: real keyword match, best-ranked first ──
-    def _has_keyword_match(t: int) -> bool:
-        if not q_words:
-            return True
-        if any(score >= 1.0 for (_i, _c, score, _k) in thread_sentences[t]):
-            return True
-        subject_words = set(re.findall(r"\w+", str(threads[t].get("subject") or "").lower()))
-        if q_words & subject_words:
-            return True
-        row_words = set(re.findall(r"\w+", " ".join(thread_tables[t]).lower()))
-        return bool(q_words & row_words)
-
-    sent_threads = [t for t in range(n_in) if _has_keyword_match(t)][:max_threads]
-    chosen = set(sent_threads)
-    for t in range(n_in):
-        if t not in chosen:
-            thread_sentences[t].clear()
-            thread_tables[t] = []
-            thread_fallback[t] = []
-
-    # ── Global dedup of prose: keep the first occurrence of each sentence ──
-    seen_keys: set[str] = set()
-    for sentences in thread_sentences:
-        kept = []
-        for orig_idx, cleaned, score, key in sentences:
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            kept.append((orig_idx, cleaned, score, key))
-        sentences[:] = kept
-
-    # ── Protected table rows (own budget; never dedup'd or scored away) ──
-    table_budget = int(budget * table_fraction)
-    table_used = 0
-    rows_kept = 0
-    rows_cut = 0
-    table_kept: list[list[str]] = [[] for _ in threads]
-    for t in sent_threads:
-        rows = thread_tables[t]
-        for i, row in enumerate(rows):
-            if table_used + len(row) + 1 > table_budget:
-                cut = len(rows) - i
-                rows_cut += cut
-                logger.warning(
-                    "build_context: cut %d of %d table rows for thread %r - "
-                    "table budget of %d chars exhausted (raise CHATBOT_CONTEXT_MAX_CHARS "
-                    "or CHATBOT_CONTEXT_TABLE_FRACTION)",
-                    cut, len(rows), threads[t].get("subject") or "(no subject)", table_budget,
-                )
-                break
-            table_kept[t].append(row)
-            table_used += len(row) + 1
-            rows_kept += 1
-
-    # ── Prose selection within what the tables left over ──
-    prose_budget = max(0, budget - table_used)
-    selected: list[set] = [set() for _ in thread_sentences]
-    used_chars = 0
-    thread_used: list[int] = [0 for _ in thread_sentences]
-    per_thread_cap = max(1, int(budget * _PER_THREAD_BUDGET_FRACTION))
-
-    def _try_add(t: int, orig_idx: int, cleaned: str) -> bool:
-        nonlocal used_chars
-        if orig_idx in selected[t]:
-            return False
-        if used_chars + len(cleaned) > prose_budget:
-            return False
-        if thread_used[t] + len(cleaned) > per_thread_cap:
-            return False
-        selected[t].add(orig_idx)
-        used_chars += len(cleaned)
-        thread_used[t] += len(cleaned)
-        return True
-
-    # 1) Guarantee the top N sentences from every sent thread (by score, then order).
-    for t in sent_threads:
-        floor = sorted(thread_sentences[t], key=lambda s: (-s[2], s[0]))[:_MIN_SENTENCES_PER_THREAD]
-        for orig_idx, cleaned, _score, _key in floor:
-            _try_add(t, orig_idx, cleaned)
-
-    # 1b) A sent thread must never end up with 0 lines: force its single best
-    #     sentence in even if that overshoots the budget slightly, else fall
-    #     back to its first plain lines.
-    forced_lines: dict[int, list[str]] = {}
-    for t in sent_threads:
-        if selected[t] or table_kept[t]:
-            continue
-        if thread_sentences[t]:
-            best = min(thread_sentences[t], key=lambda s: (-s[2], s[0]))
-            selected[t].add(best[0])
-            used_chars += len(best[1])
-            thread_used[t] += len(best[1])
-        elif thread_fallback[t]:
-            forced_lines[t] = thread_fallback[t]
-
-    # 2) Fill remaining budget with the globally best-scoring sentences.
-    ranked = sorted(
-        (
-            (t, orig_idx, cleaned, score)
-            for t, sentences in enumerate(thread_sentences)
-            for (orig_idx, cleaned, score, _key) in sentences
-        ),
-        key=lambda s: (-s[3], s[0], s[1]),
-    )
-    for t, orig_idx, cleaned, _score in ranked:
-        _try_add(t, orig_idx, cleaned)
-
-    # 3) Keep a numeric/date/amount sentence that sits right next to a kept one.
-    for t, sentences in enumerate(thread_sentences):
-        for orig_idx, cleaned, _score, _key in sentences:
-            if orig_idx in selected[t] or not _has_numeric(cleaned):
-                continue
-            if (orig_idx - 1) in selected[t] or (orig_idx + 1) in selected[t]:
-                _try_add(t, orig_idx, cleaned)
-
-    # ── Render in original thread + sentence order, tables after the prose ──
-    blocks: list[str] = []
-    kept_per_thread: list[tuple] = []
-    for t, chunk in enumerate(threads):
-        subject = chunk.get("subject") or "(no subject)"
-        by_idx = {orig_idx: cleaned for (orig_idx, cleaned, _s, _k) in thread_sentences[t]}
-        lines = [by_idx[i] for i in sorted(selected[t]) if i in by_idx]
-        lines += forced_lines.get(t, [])
-        lines += table_kept[t]
-        kept_per_thread.append((t + 1, subject, len(lines)))
-        if t not in chosen:
-            continue
-        if not lines:
-            logger.warning("build_context: thread %r has no usable body lines to send", subject)
-            continue
-        blocks.append(f"[Email {len(blocks) + 1}: {subject}]\n" + "\n".join(lines))
-
-    if stats is not None:
-        stats["kept_per_thread"] = kept_per_thread
-        stats["threads_in"] = n_in
-        stats["threads_used"] = len(blocks)
-        stats["table_rows_kept"] = rows_kept
-        stats["table_rows_cut"] = rows_cut
-
-    return "\n\n".join(blocks) if blocks else "(no relevant emails found)"
+    stats["threads_used"] = len(parts)
+    context = _BLOCK_SEPARATOR.join(parts) if parts else empty
+    stats["chars_sent"] = len(context)
+    return context
 
 
 def format_context(chunks: list[dict], question: str = "") -> str:
     """Format retrieved thread chunks into a compact context string for the LLM.
 
-    Thin wrapper over :func:`build_context` kept under the existing name so
-    callers in ``chatbot.service`` need only pass the user question. Keeps ALL
-    retrieved threads but sends only deduplicated, question-relevant sentences
-    from each thread's subject + body (see build_context for the rules).
+    Thin wrapper over :func:`build_context` kept under the existing name.
     """
     return build_context(chunks, question)
