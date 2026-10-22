@@ -330,7 +330,9 @@ async def _run_one_email_summarizer_test(
             parse_success=True,
             attempts=attempts,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
+        # Full exception in the server log; the result (returned by the route) carries constant text.
+        logger.exception("Email summarizer test failed")
         quality_data = evaluate_bu_response_quality(raw_response or "")
         result = EmailSummarizerTestResult(
             timestamp=datetime.now(timezone.utc),
@@ -346,7 +348,7 @@ async def _run_one_email_summarizer_test(
             quality=EmailSummarizerQualityReport(**quality_data),
             parse_success=False,
             attempts=attempts,
-            error=str(exc),
+            error="Email summarization failed.",
         )
     await test_log_store.append_test_result(result, settings=settings)
     return result
@@ -2201,7 +2203,7 @@ def _semantic_candidate_clusters(
 def _parse_relevant_cluster_keys(raw: str, allowed: set[str]) -> tuple[list[str], str, bool]:
     """Validate the cluster relevance gate response as the strict JSON contract."""
     text = (raw or "").strip()
-    fence = re.search(r"```(?:\w+)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    fence = re.search(r"```(?:\w+)?\s*(.*?)\s*```", text, re.DOTALL)
     if fence:
         text = fence.group(1).strip()
     if not text:

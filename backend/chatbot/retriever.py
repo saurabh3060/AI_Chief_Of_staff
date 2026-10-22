@@ -394,9 +394,9 @@ _REPLY_BOUNDARY_RE = re.compile(
 # A line that is only a sign-off ("Regards,", "Thanks and regards", "Sent from
 # my ..."). The rest of that paragraph (name, title, phone) is the signature.
 _SIGNOFF_RE = re.compile(
-    r"^\s*(?:(?:(?:best|warm|kind|with)\s+)?(?:regards|thanks|thank you|sincerely|cheers|br"
-    r"|yours (?:faithfully|sincerely))(?:\s*(?:and|&)\s*regards)?\s*[,.!]?"
-    r"|sent from my\b.*)\s*$",
+    r"^\s*(?:(?:(?:best|warm|kind|with)\s{1,3})?(?:regards|thanks|thank you|sincerely|cheers|br"
+    r"|yours (?:faithfully|sincerely))(?:\s{0,3}(?:and|&)\s{0,3}regards)?\s{0,3}[,.!]?"
+    r"|sent from my\b[^\n]{0,60})\s*$",
     re.IGNORECASE,
 )
 # Paragraphs that are legal/confidentiality boilerplate.
@@ -405,10 +405,10 @@ _DISCLAIMER_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
-_EMAIL_RE = re.compile(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+")
+_EMAIL_RE = re.compile(r"[\w.+\-]{1,64}@[\w\-]{1,255}\.[\w.\-]{1,255}")
 # A short line that is almost entirely an address / phone block.
 _ADDRESS_BLOCK_RE = re.compile(
-    r"^\s*(tel|phone|mob|mobile|fax|ext|ph|m|t)\s*[:.]?\s*[\d +()\-]{6,}\s*$",
+    r"^\s*(?:tel|phone|mob|mobile|fax|ext|ph|m|t)\s{0,3}[:.]?\s{0,3}[\d +()\-]{6,40}$",
     re.IGNORECASE,
 )
 # Invisible characters and replacement marks that only come from bad decoding.
@@ -427,7 +427,10 @@ _FIGURE_RE = re.compile(r"\d|%|[₹$€£¥]")
 _DIGIT_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*")
 # Sub-question separators: commas (not inside numbers), ";", "&", "and" and
 # list numbering such as "1)" / "2.".
-_SUBQ_SPLIT_RE = re.compile(r"\s*(?:,(?=\s|$)|;|&|\band\b|\b\d{1,2}[.)](?=\s))\s*", re.IGNORECASE)
+_SUBQ_SPLIT_RE = re.compile(r"(?:,(?=\s|$)|;|&|\band\b|\b\d{1,2}[.)](?=\s))", re.IGNORECASE)
+# Question text is capped at this many characters before the sub-question split
+# (the pieces are stripped afterwards, so no surrounding \s* is needed in the pattern).
+MAX_REGEX_INPUT_LEN = 10000
 
 _STOPWORDS = {
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
@@ -869,7 +872,7 @@ def _sub_questions(question: str, ignore_words) -> list[str]:
     (split on commas, ';', '&', 'and' and numbering) that still has
     significant words of its own."""
     queries = [question]
-    parts = [p.strip() for p in _SUBQ_SPLIT_RE.split(question or "") if p and p.strip()]
+    parts = [p.strip() for p in _SUBQ_SPLIT_RE.split((question or "")[:MAX_REGEX_INPUT_LEN]) if p and p.strip()]
     if len(parts) > 1:
         for part in parts:
             if _question_words(part, ignore_words) and part not in queries:

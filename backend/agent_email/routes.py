@@ -114,9 +114,12 @@ async def test_bu_email_summarizer(
         # The user-supplied message_id failed opaque-path-segment validation
         # (CWE-918 guard). Surface it as a 400 Bad Request rather than a 500
         # so a crafted id is rejected cleanly without ever building a URL.
-        raise HTTPException(status_code=400, detail=f"Invalid message_id: {exc}") from exc
+        # The validator's message can echo the rejected value, so it is logged only.
+        logger.exception("Email summarizer test rejected an unsafe message_id")
+        raise HTTPException(status_code=400, detail="Invalid message_id.") from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+        logger.exception("Email summarizer test could not read the requested messages")
+        raise HTTPException(status_code=403, detail="Access to the requested messages is not available.") from exc
 
 
 @router.get("/clusters")

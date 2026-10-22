@@ -171,12 +171,14 @@ async def create_meeting_note(
                 status_code=500,
                 detail="Failed to write meeting note",
             )
+    except HTTPException:
+        raise
     except RuntimeError as exc:
-        logger.error("[MEETING-NOTES] DB error: %s", exc)
+        logger.exception("[MEETING-NOTES] DB error")
         raise HTTPException(status_code=500, detail="Database error") from exc
     except Exception as exc:
-        logger.error("[MEETING-NOTES] unexpected error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        logger.exception("[MEETING-NOTES] unexpected error")
+        raise HTTPException(status_code=500, detail="An internal error occurred.") from exc
 
     # Read back the created note to return with timestamps
     try:

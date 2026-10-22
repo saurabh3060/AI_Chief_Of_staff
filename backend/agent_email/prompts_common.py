@@ -268,9 +268,11 @@ def repair_llm_json_text(text: str) -> str:
     repaired = re.sub(r",(\s*[\]}])", r"\1", repaired)
 
     # --- Step 3: insert missing commas between adjacent elements ---
-    repaired = re.sub(r'"(\s*\n\s*)"', r'",\1"', repaired)
-    repaired = re.sub(r'\}(\s*\n\s*)\{', r'},\1{', repaired)
-    repaired = re.sub(r'"(\s*\n\s*)\{', r'",\1{', repaired)
+    # `[^\S\n]*\n\s*` = whitespace that contains a newline, without the overlapping \s*\n\s*
+    # ambiguity (py/polynomial-redos).
+    repaired = re.sub(r'"([^\S\n]*\n\s*)"', r'",\1"', repaired)
+    repaired = re.sub(r'\}([^\S\n]*\n\s*)\{', r'},\1{', repaired)
+    repaired = re.sub(r'"([^\S\n]*\n\s*)\{', r'",\1{', repaired)
 
     # --- Step 4: balance trailing brackets ---
     stack: list[str] = []

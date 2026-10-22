@@ -142,13 +142,21 @@ def _operation(question: str, n_periods: int) -> str:
     return "trend"
 
 
+# "from X to Y" / "between X and Y" wording (the gap between the two words is bounded) or
+# "through" / "till"; the question is capped before matching (py/polynomial-redos).
+_MAX_REGEX_INPUT_LEN = 10000
+_RANGE_WORDING_RE = re.compile(
+    r"(?i)\bfrom\b[^\n]{0,300}\bto\b|\bbetween\b[^\n]{0,300}\band\b|\bthrough\b|\btill\b"
+)
+
+
 def _periods(question: str) -> tuple[str | None, int]:
     """The periods the question names, as analyze_metric's `periods` string, and how many."""
     found = [question[s:e] for _, (s, e) in periods.find_all(question)]
     if not found:
         return None, 0
-    if len(found) == 2 and re.search(r"(?i)\bfrom\b.*\bto\b|\bbetween\b.*\band\b|\bthrough\b|\btill\b",
-                                     question) and not re.search(r"(?i)\bvs\.?\b|\bversus\b", question):
+    if len(found) == 2 and _RANGE_WORDING_RE.search(question[:_MAX_REGEX_INPUT_LEN]) and not re.search(
+            r"(?i)\bvs\.?\b|\bversus\b", question):
         return f"{found[0]} to {found[1]}", 2
     return ", ".join(found), len(found)
 

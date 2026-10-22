@@ -640,7 +640,9 @@ def text_numbers(para: str) -> list[dict]:
     sure}. `sure` needs a known metric whose kind fits the number and a period; anything less is
     kept, flagged, and never computed with."""
     out = []
-    for clause in re.split(r"(?<=[.;])\s+|,\s+(?=[A-Za-z])|\s+(?:and|while|whereas|but)\s+", para):
+    for clause in re.split(
+        r"(?<=[.;])\s{1,20}|,\s{1,20}(?=[A-Za-z])|\s{1,20}(?:and|while|whereas|but)\s{1,20}", para
+    ):
         forward = bool(_FORWARD.search(clause))
         found_periods = [(p, s) for p, s in periods.find_all(clause) if not _RANGE_START.search(clause[:s[0]])]
         mets = metrics_in(clause)

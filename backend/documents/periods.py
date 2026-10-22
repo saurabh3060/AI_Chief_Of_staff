@@ -94,7 +94,9 @@ def day(y: int, m: int, d: int) -> Period | None:
 
 
 # (pattern, builder). Order matters: longer forms first so "Q1FY26" is not read as "FY26".
-_FY = r"fy\s*'?\s*(?:(\d{4}|\d{2})\s*[-/]\s*(\d{2}|\d{4})|(\d{4}|\d{2}))"
+# Whitespace runs are bounded ({0,5}) so adjacent \s* around an optional separator cannot
+# backtrack quadratically on long whitespace (py/polynomial-redos).
+_FY = r"fy\s{0,5}'?\s{0,5}(?:(\d{4}|\d{2})\s{0,5}[-/]\s{0,5}(\d{2}|\d{4})|(\d{4}|\d{2}))"
 
 
 def _fy_end(m: re.Match, first: int) -> int:
@@ -104,13 +106,13 @@ def _fy_end(m: re.Match, first: int) -> int:
 
 
 _PATTERNS: list[tuple[re.Pattern, callable]] = [
-    (re.compile(rf"\bq\s*([1-4])\s*[-']?\s*{_FY}", re.I),
+    (re.compile(rf"\bq\s{{0,5}}([1-4])\s{{0,5}}[-']?\s{{0,5}}{_FY}", re.I),
      lambda m: quarter(_fy_end(m, 2), int(m.group(1)))),
-    (re.compile(rf"\b{_FY}\s*[-/]?\s*q\s*([1-4])\b", re.I),
+    (re.compile(rf"\b{_FY}\s{{0,5}}[-/]?\s{{0,5}}q\s{{0,5}}([1-4])\b", re.I),
      lambda m: quarter(_fy_end(m, 1), int(m.group(4)))),
-    (re.compile(rf"\bh\s*([12])\s*[-']?\s*{_FY}", re.I),
+    (re.compile(rf"\bh\s{{0,5}}([12])\s{{0,5}}[-']?\s{{0,5}}{_FY}", re.I),
      lambda m: half(_fy_end(m, 2), int(m.group(1)))),
-    (re.compile(rf"\b9\s*m\s*[-']?\s*{_FY}", re.I),
+    (re.compile(rf"\b9\s{{0,5}}m\s{{0,5}}[-']?\s{{0,5}}{_FY}", re.I),
      lambda m: nine_months(_fy_end(m, 1))),
     # 30.09.2025, 30/09/2025, 30-09-25 (day first, as written in India)
     (re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})\b"),

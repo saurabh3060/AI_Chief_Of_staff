@@ -481,7 +481,8 @@ async def score_candidate_pool(
                 message.subject,
                 exc,
             )
-            return message, "", [], str(exc), None, {}, None, ""
+            # The exception is logged above; the returned reason is constant text.
+            return message, "", [], "context evaluation failed", None, {}, None, ""
 
     # Fan the per-email extraction + meeting-match out over the shared bounded
     # worker pool (default 1 worker). This gives relevance extraction the same

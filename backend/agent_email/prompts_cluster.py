@@ -273,7 +273,7 @@ def build_cluster_synthesis_prompt(
 def parse_cluster_synthesis_response(response_text: str, source_text: str = "") -> dict:
     """Parse cluster synthesis LLM JSON with tolerant repair and source grounding."""
     text = response_text.strip()
-    json_match = re.search(r"```(?:json)?\s*\n?\s*(\{.*\})\s*\n?\s*```", text, re.DOTALL)
+    json_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
     if json_match:
         text = json_match.group(1).strip()
     else:

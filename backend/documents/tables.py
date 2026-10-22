@@ -914,7 +914,7 @@ def markdown_tables(text: str) -> list[tuple[str, list[list[str]]]]:
             grid.append(cells)
         else:
             flush()
-            m = re.match(r"#+\s*(?:table:)?\s*(.*)", s, re.I)
+            m = re.match(r"#+\s*(?:table:\s*)?(.*)", s, re.I)
             if m and m.group(1) and "<" not in m.group(1):  # "<table title as printed>" echoed
                 title = m.group(1).strip()
     flush()

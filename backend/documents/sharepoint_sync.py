@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-import traceback
 from pathlib import Path
 
 from core.config import get_settings
@@ -136,13 +135,14 @@ async def _do_sync(
                     drive_items.extend(items)
                     logger.info("[SHAREPOINT-SYNC] Found %d files in %s",
                                 len(items), site_url[:80])
-                except Exception as exc:
-                    logger.error("[SHAREPOINT-SYNC] Failed to list folder %s: %s",
-                                 site_url[:80], exc)
-                    summary["errors"].append(f"Listing {site_url[:80]} failed: {exc}")
-    except Exception as exc:
-        logger.error("[SHAREPOINT-SYNC] Failed to list SharePoint folders: %s", exc)
-        summary["errors"].append(f"Listing failed: {exc}")
+                except Exception:
+                    # Exception detail goes to the server log only; the summary
+                    # (returned by the status route) carries constant text.
+                    logger.exception("[SHAREPOINT-SYNC] Failed to list folder %s", site_url[:80])
+                    summary["errors"].append(f"Listing {site_url[:80]} failed")
+    except Exception:
+        logger.exception("[SHAREPOINT-SYNC] Failed to list SharePoint folders")
+        summary["errors"].append("Listing failed")
         summary["duration_s"] = round(time.perf_counter() - t0, 1)
         summary["status"] = "failed"
         sync_state.update_sync_result(state, "failed", summary)
@@ -176,13 +176,10 @@ async def _do_sync(
             summary["synced"] += 1
             logger.info("[SHAREPOINT-SYNC] Ingested: %s -> doc_id=%s", display, doc_id)
 
-        except Exception as exc:
-            error_msg = f"{display}: {exc}"
-            logger.error(
-                "[SHAREPOINT-SYNC] Failed to sync %s: %s\n%s",
-                display, exc, traceback.format_exc(),
-            )
-            summary["errors"].append(error_msg)
+        except Exception:
+            # Full traceback in the server log; the summary keeps constant text only.
+            logger.exception("[SHAREPOINT-SYNC] Failed to sync %s", display)
+            summary["errors"].append(f"{display}: sync failed")
             summary["failed"] += 1
 
     # ── Step 3: Finalize ──────────────────────────────────────
@@ -235,8 +232,10 @@ async def sync_single_file(
         sync_state.record_sync(state, item_id, item_data, doc_id)
         await sync_state.save_state(state)
         return {"status": "success", "doc_id": doc_id, "name": item_data.get("name", "")}
-    except Exception as exc:
-        return {"status": "failed", "error": str(exc), "name": item_data.get("name", "")}
+    except Exception:
+        # Detail stays in the server log; the result (returned by the route) is constant.
+        logger.exception("[SHAREPOINT-SYNC] Single-file sync failed for item %s", item_id)
+        return {"status": "failed", "error": "Single-file sync failed.", "name": item_data.get("name", "")}
 
 
 async def _download_and_ingest(

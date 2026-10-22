@@ -359,7 +359,7 @@ def parse_bu_email_response(response_text: str) -> dict:
     """
     text = response_text.strip()
  
-    json_match = re.search(r'```(?:json)?\s*\n?\s*(\{.*?\})\s*\n?\s*```', text, re.DOTALL)
+    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
     if json_match:
         text = json_match.group(1).strip()
     else:

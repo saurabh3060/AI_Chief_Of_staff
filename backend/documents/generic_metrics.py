@@ -681,7 +681,12 @@ def import_rows(path: str, *, default_page: int | None = None, source_name: str 
             unit = field("output_type") or _output_unit(name, formula, example) or unit
             status, error = "approved", ""
         except ValueError as exc:
-            operation, spec, unit, status, error = "unsupported", {}, "", "needs_review", str(exc)
+            # The compiler's message is exception text: the operator gets it in the log, while the
+            # stored review reason (which can reach users in an answer) is a constant (CWE-209).
+            logger.warning("[DOC-GM] rule %s needs review - formula did not compile: %s",
+                           rule_id, sanitize_log_input(str(exc)))
+            operation, spec, unit, status, error = ("unsupported", {}, "", "needs_review",
+                                                    "the business formula could not be compiled into a validated calculation")
         compiled.append({"rule_id":rule_id, "source_name":source_name,
                          "document_pattern":document_pattern(source_name), "source_page":page,
                          "metric_family":str(row.get(columns["family"], "")).strip(), "metric_name":name,

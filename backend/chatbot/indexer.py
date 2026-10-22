@@ -106,7 +106,7 @@ async def _save_embeddings_batch(records: list[dict]) -> int:
 
 # Pre-compiled pattern to detect pre-concatenated thread blobs (bu_emails format)
 _THREAD_HEADER_RE = re.compile(
-    r"---\s*Message from\s+.+?\s+on\s+\d{4}-\d{2}-\d{2}T[\d:+\-Z.]+\s*---",
+    r"---\s{0,5}Message from\s{1,5}.{1,200}?\s{1,5}on\s{1,5}\d{4}-\d{2}-\d{2}T[\d:+\-Z.]{1,40}\s{0,5}---",
     re.IGNORECASE,
 )
 
@@ -141,7 +141,7 @@ def _embed(text: str) -> list[float]:
 
 def _normalise_for_comparison(text: str) -> str:
     """Normalize text only for duplicate detection; stored text is preserved."""
-    text = re.sub(r"(?m)^\s*>+\s?", "", text or "")
+    text = re.sub(r"(?m)^[ \t]*>+[ \t]?", "", text or "")
     return re.sub(r"\s+", " ", text).strip().casefold()
 
 
@@ -161,15 +161,17 @@ def _strip_verified_quoted_suffix(body: str, earlier_bodies: list[str]) -> str:
         return ""
 
     boundaries = []
+    # Line-anchored patterns use [ \t] (not \s, which also matches newlines) so a run of blank
+    # lines cannot be rescanned from every line start (py/polynomial-redos).
     for pattern in (
-        r"(?im)^\s*-{2,}\s*original message\s*-{2,}\s*$",
-        r"(?im)^\s*on .{5,250} wrote:\s*$",
+        r"(?im)^[ \t]*-{2,}[ \t]*original message[ \t]*-{2,}[ \t]*$",
+        r"(?im)^[ \t]*on .{5,250} wrote:[ \t]*$",
     ):
         boundaries.extend(match.start() for match in re.finditer(pattern, body))
 
-    for match in re.finditer(r"(?im)^\s*from:\s*.+$", body):
+    for match in re.finditer(r"(?im)^[ \t]*from:[ \t]*.+$", body):
         header = body[match.start():match.start() + 800]
-        if all(re.search(rf"(?im)^\s*{field}:\s*.+$", header) for field in ("sent", "to", "subject")):
+        if all(re.search(rf"(?im)^[ \t]*{field}:[ \t]*.+$", header) for field in ("sent", "to", "subject")):
             boundaries.append(match.start())
 
     for boundary in sorted(set(boundaries)):

@@ -160,7 +160,7 @@ def parse_relevance_context(raw_text: str) -> dict:
     text = (raw_text or "").strip()
     if not text:
         return empty
-    fence = re.search(r"```(?:\w+)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    fence = re.search(r"```(?:\w+)?\s*(.*?)\s*```", text, re.DOTALL)
     if fence:
         text = fence.group(1).strip()
     try:

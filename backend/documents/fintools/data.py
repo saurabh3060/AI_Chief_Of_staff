@@ -15,8 +15,10 @@ from ._registry import tool
 MAX_LABELS = 12
 MAX_ROWS = 400
 
-_RANGE_SEP = re.compile(r"\s*(?:-|–|—|to|through|thru|till|until)\s*", re.I)
-_SPLIT = re.compile(r"\s*(?:,|;|\band\b|&|\bvs\.?\b|\bversus\b)\s*", re.I)
+# No surrounding \s* in these two: callers strip the text / the split pieces, which keeps the
+# patterns free of adjacent open-ended whitespace runs (py/polynomial-redos).
+_RANGE_SEP = re.compile(r"(?:-|–|—|to|through|thru|till|until)", re.I)
+_SPLIT = re.compile(r"(?:,|;|\band\b|&|\bvs\.?\b|\bversus\b)", re.I)
 _FY_RANGE = re.compile(r"\bfy\s*'?(\d{2})\s*(?:-|–|—|to)\s*(?:fy\s*'?)?(\d{2})\b", re.I)
 
 
@@ -74,7 +76,7 @@ def parse_periods(spec) -> list[PeriodSpec]:
         if one:
             out.append(one)
             continue
-        for part in filter(None, _SPLIT.split(chunk)):
+        for part in filter(None, (piece.strip() for piece in _SPLIT.split(chunk))):
             one = _parse_one(part)
             if not one:
                 raise ValueError(f"can't read the period {part!r} (try e.g. 'FY26', 'Q1FY26', 'Jun-25', "
@@ -96,7 +98,7 @@ def _parse_one(text: str) -> PeriodSpec | None:
         return PeriodSpec(text, p, p)
     if len(hits) == 2:
         (a, (_, a_end)), (b, (b_start, _)) = hits
-        if a.kind == b.kind and _RANGE_SEP.fullmatch(text[a_end:b_start]) is not None:
+        if a.kind == b.kind and _RANGE_SEP.fullmatch(text[a_end:b_start].strip()) is not None:
             a, b = sorted((a, b), key=lambda p: p.start)
             return PeriodSpec(text, a, b)
     if not hits:

@@ -42,7 +42,13 @@ from chatbot.redis_history import (
     save_message,
 )
 from chatbot.redis_qa_cache import clear_qa_cache, get_cached_answer, set_cached_answer
-from chatbot.service import GREETING_RESPONSE, answer_question, generate_response_stream, is_greeting
+from chatbot.service import (
+    GREETING_RESPONSE,
+    STREAM_ERROR_MESSAGE,
+    answer_question,
+    generate_response_stream,
+    is_greeting,
+)
 from core.logging_config import get_agent_logger, sanitize_log_value
 from core.utils import sanitize_log_input
 
@@ -53,6 +59,24 @@ router = APIRouter(prefix="/chatbot", tags=["chatbot"])
 # The only error text a document stream ever sends to the client (CWE-209):
 # whatever the pipeline reports, the details stay in the server log.
 _DOC_STREAM_ERROR_MESSAGE = "Document search failed. Please try again later."
+
+
+def _error_event(message: str) -> str:
+    """One SSE ``error`` event that carries only the given constant message."""
+    return f"data: {json.dumps({'type': 'error', 'content': message})}\n\n"
+
+
+def _scrub_error_event(chunk: str, message: str) -> str:
+    """Pass an SSE chunk through unchanged, except that an ``error`` event is
+    re-emitted with the fixed ``message`` so no upstream error text can reach the client."""
+    if chunk.startswith("data: "):
+        try:
+            payload = json.loads(chunk[6:].strip())
+        except (json.JSONDecodeError, ValueError):
+            return chunk
+        if isinstance(payload, dict) and payload.get("type") == "error":
+            return _error_event(message)
+    return chunk
 
 # ── Global chatbot state ──────────────────────────────────────
 # Weaviate mode uses "wv_client"; "bm25" is the local keyword index
@@ -356,27 +380,27 @@ async def query_stream(
             answer_text = ""
             doc_sources: list = []
             had_error = False
-            async for chunk in stream_answer(query=message):
-                # Capture answer tokens + sources for history / cache persistence.
-                try:
-                    if chunk.startswith("data: "):
-                        payload = json.loads(chunk[6:].strip())
-                        ptype = payload.get("type")
-                        if ptype == "token":
-                            answer_text += payload.get("content", "")
-                        elif ptype == "sources":
-                            doc_sources = payload.get("sources", [])
-                        elif ptype == "error":
-                            had_error = True
-                            # Never forward upstream error text: re-emit a fixed message.
-                            chunk = (
-                                "data: "
-                                + json.dumps({"type": "error", "content": _DOC_STREAM_ERROR_MESSAGE})
-                                + "\n\n"
-                            )
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                yield chunk
+            try:
+                async for chunk in stream_answer(query=message):
+                    # Capture answer tokens + sources for history / cache persistence.
+                    try:
+                        if chunk.startswith("data: "):
+                            payload = json.loads(chunk[6:].strip())
+                            ptype = payload.get("type")
+                            if ptype == "token":
+                                answer_text += payload.get("content", "")
+                            elif ptype == "sources":
+                                doc_sources = payload.get("sources", [])
+                            elif ptype == "error":
+                                had_error = True
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    # Error events always leave with the fixed message (CWE-209).
+                    yield _scrub_error_event(chunk, _DOC_STREAM_ERROR_MESSAGE)
+            except Exception:
+                logger.exception("Document streaming query failed")
+                had_error = True
+                yield _error_event(_DOC_STREAM_ERROR_MESSAGE)
             # Stream finished — persist the Q&A pair to Redis.
             if answer_text:
                 save_message(message, answer_text)
@@ -410,11 +434,17 @@ async def query_stream(
     logger.info("New streaming query: '%s'", sanitized_item_id)
 
     def event_generator():
-        yield from generate_response_stream(
-            question=message,
-            bm25_index=_chatbot_state["bm25"],
-            wv_client=_chatbot_state["wv_client"],
-        )
+        try:
+            for chunk in generate_response_stream(
+                question=message,
+                bm25_index=_chatbot_state["bm25"],
+                wv_client=_chatbot_state["wv_client"],
+            ):
+                # Error events always leave with the fixed message (CWE-209).
+                yield _scrub_error_event(chunk, STREAM_ERROR_MESSAGE)
+        except Exception:
+            logger.exception("Streaming query failed")
+            yield _error_event(STREAM_ERROR_MESSAGE)
 
     return StreamingResponse(
         event_generator(),
