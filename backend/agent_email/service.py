@@ -45,6 +45,7 @@ from agent_email.clustering import (
     split_for_synthesis,
     tag_candidates_with_topics,
 )
+from agent_email.pipeline_cache import chat_with_cache
 from agent_email.pipeline_metrics import PipelineMetricsCollector
 from agent_email.ocr import parse_attachment
 from agent_email.prompts import (
@@ -501,16 +502,21 @@ async def _synthesize_cluster_batch(
         run_id, batch_no, len(indices), len(notes_data), len(prompt), assigned_department,
     )
     max_retries = 2
+    use_cache = True  # turned off once a cached reply fails to parse (a retry must re-ask the model)
     for attempt in range(max_retries + 1):
         try:
-            raw = await ollama_client.chat(
-                prompt,
+            raw, ticket = await chat_with_cache(
+                ollama_client,
+                settings,
+                task="cluster_synthesis",
+                prompt=prompt,
                 system_prompt=CLUSTER_SYNTHESIS_SYSTEM_PROMPT,
                 num_predict=int(
                     getattr(settings, "ollama_cluster_synth_num_predict", 0)
                     or getattr(settings, "ollama_num_predict", 0)
                     or 2048
                 ),
+                use_cache=use_cache,
             )
             parsed = parse_cluster_synthesis_response(raw, source_text=appended)
             if assigned_department:
@@ -529,8 +535,10 @@ async def _synthesize_cluster_batch(
                 tokens_in=len(prompt.split()),
                 tokens_out=len(raw.split()),
             )
+            await ticket.commit(settings, raw)  # only a reply that parsed is cached
             return parsed
         except ValueError as exc:
+            use_cache = False
             logger.warning("[CLUSTER-SYNTH run=%s] batch=%d parse failure attempt=%d: %s", run_id, batch_no, attempt + 1, exc)
             PipelineMetricsCollector.record_llm_call(
                 "cluster_synthesis",

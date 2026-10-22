@@ -1239,6 +1239,38 @@ class Settings(BaseSettings):
         validation_alias="EMAIL_PIPELINE_RELEVANCE_WORKERS",
     )
 
+    # ---- Email pipeline exact-match caches (Redis; pipeline-only) ----
+    # Exact-input caches for the pipeline's LLM replies and embeddings, kept
+    # under their OWN key prefix so they are never mixed with the chatbot's
+    # keys (chatbot:*) nor wiped by the pipeline's scoped clear of
+    # REDIS_KEY_PREFIX. A hit returns the stored reply for the identical
+    # (model + full prompt + generation params) / (model + text), so no call
+    # whose exact input was already answered is repeated. Any cache problem
+    # falls back to the normal call. Off switch: EMAIL_PIPELINE_CACHE_ENABLED.
+    email_pipeline_cache_enabled: bool = Field(
+        default=True,
+        alias="EMAIL_PIPELINE_CACHE_ENABLED",
+        validation_alias="EMAIL_PIPELINE_CACHE_ENABLED",
+    )
+    # Must not start with "chatbot:" or with REDIS_KEY_PREFIX (the cache is
+    # then disabled with a warning); sub-namespaces llmcache:/embcache: are
+    # appended to it.
+    email_pipeline_cache_prefix: str = Field(
+        default="emailagent:",
+        alias="EMAIL_PIPELINE_CACHE_PREFIX",
+        validation_alias="EMAIL_PIPELINE_CACHE_PREFIX",
+    )
+    email_pipeline_llm_cache_ttl_seconds: int = Field(
+        default=7 * 24 * 60 * 60,
+        alias="EMAIL_PIPELINE_LLM_CACHE_TTL_SECONDS",
+        validation_alias="EMAIL_PIPELINE_LLM_CACHE_TTL_SECONDS",
+    )
+    email_pipeline_embedding_cache_ttl_seconds: int = Field(
+        default=30 * 24 * 60 * 60,
+        alias="EMAIL_PIPELINE_EMBEDDING_CACHE_TTL_SECONDS",
+        validation_alias="EMAIL_PIPELINE_EMBEDDING_CACHE_TTL_SECONDS",
+    )
+
     # ---- Retry / backoff ----
     retry_max_attempts: int = 3
     retry_base_delay_seconds: float = 1.0

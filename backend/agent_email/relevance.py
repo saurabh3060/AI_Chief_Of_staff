@@ -29,6 +29,7 @@ from agent_email.prompts import (
     parse_relevance_context,
     render_relevance_context,
 )
+from agent_email.pipeline_cache import chat_with_cache
 from agent_email.pipeline_metrics import PipelineMetricsCollector
 from agent_email.schema import EmailCandidate, EmailMessage
 from agent_email.semantic_match import cosine_similarity, embed_text
@@ -179,12 +180,17 @@ async def _extract_email_context(
     client = OllamaClient(settings=settings)
     max_retries = 2
     last_error: Exception | None = None
+    use_cache = True  # turned off once a cached reply fails validation (a retry must re-ask the model)
     for attempt in range(max_retries + 1):
         try:
-            raw = await client.chat(
-                prompt,
+            raw, ticket = await chat_with_cache(
+                client,
+                settings,
+                task="relevance_context",
+                prompt=prompt,
                 system_prompt=RELEVANCE_CONTEXT_SYSTEM_PROMPT,
                 num_predict=1024,
+                use_cache=use_cache,
             )
             parsed = parse_relevance_context(raw)
             has_content = bool(
@@ -200,6 +206,10 @@ async def _extract_email_context(
                 error=not has_content,
                 retry_exhausted=(not has_content and attempt >= max_retries),
             )
+            if has_content:
+                await ticket.commit(settings, raw)  # only a validated reply is cached
+            elif ticket.hit:
+                use_cache = False
             if has_content or attempt >= max_retries:
                 return parsed
             logger.info(
@@ -208,6 +218,7 @@ async def _extract_email_context(
             )
         except Exception as exc:  # noqa: BLE001
             last_error = exc
+            use_cache = False
             PipelineMetricsCollector.record_llm_call(
                 "relevance_context",
                 error=True,
@@ -344,6 +355,7 @@ async def _match_specific_meetings(
     )
     client = OllamaClient(settings=settings)
     validation_reason = "invalid relevance decision"
+    use_cache = True  # turned off once a cached reply fails validation (a retry must re-ask the model)
     for attempt in range(1, 3):
         prompt = base_prompt
         if attempt > 1:
@@ -353,10 +365,14 @@ async def _match_specific_meetings(
                 "the candidate meeting_key values above, with no markdown or surrounding text."
             )
         try:
-            raw = await client.chat(
-                prompt,
+            raw, ticket = await chat_with_cache(
+                client,
+                settings,
+                task="meeting_relevance_match",
+                prompt=prompt,
                 system_prompt=SPECIFIC_MEETING_RELEVANCE_SYSTEM_PROMPT,
                 num_predict=512,
+                use_cache=use_cache,
             )
             PipelineMetricsCollector.record_llm_call(
                 "meeting_relevance_match",
@@ -390,6 +406,7 @@ async def _match_specific_meetings(
                     run_id, email_id, subject, matched_keys, reason,
                 )
                 validation_reason = "response matched prompt example verbatim"
+                use_cache = False
                 # Retry once; if it happens again on the final attempt, fail closed
                 # rather than trust a decision that looks copied, not reasoned.
                 if attempt < 2:
@@ -400,8 +417,10 @@ async def _match_specific_meetings(
                 "[POOL-RELEVANCE-LLM run=%s] email_id=%r subject=%r -> selected_meeting_id=%s reason=%r",
                 run_id, email_id, subject, selected_ids or "none", reason,
             )
+            await ticket.commit(settings, raw)  # only an accepted decision is cached
             return selected_ids, reason
         validation_reason = reason
+        use_cache = False
         logger.warning(
             "[POOL-RELEVANCE-LLM run=%s] subject=%r attempt=%d malformed=%r%s",
             run_id,

@@ -119,6 +119,18 @@ class OllamaClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
 
+    def generation_params(self, num_predict: int | None = None) -> dict:
+        """The model name and generation parameters ``chat()`` will use for this
+        ``num_predict`` - the single source of truth shared with ``chat()`` so an
+        exact-match cache key can never drift from what is actually sent."""
+        predict = num_predict if num_predict is not None else int(getattr(self._settings, "ollama_num_predict", 0) or 0)
+        return {
+            "model": self._settings.effective_text_model,
+            "temperature": self._settings.ollama_temperature,
+            "num_ctx": self._settings.ollama_num_ctx,
+            "num_predict": predict if predict and predict > 0 else 0,
+        }
+
     def _build_chat_model(self, model_name: str, num_predict: int | None = None) -> ChatOllama:
         """Construct a `ChatOllama` instance pointed at the configured Ollama host and the given model."""
         kwargs: dict = {
