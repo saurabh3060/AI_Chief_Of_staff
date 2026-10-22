@@ -129,6 +129,9 @@ GREETING_RESPONSE = (
 
 NOT_FOUND_RESPONSE = "Not found in the provided emails."
 
+# Sent to the client in an SSE "error" event; exception details stay in the server log.
+STREAM_ERROR_MESSAGE = "An internal error occurred. Please try again."
+
 def _matches_pattern(pattern: str, setting_name: str, query: str) -> bool:
     """Case-insensitive regex match of a question; an invalid pattern logs a
     WARNING and counts as no match."""
@@ -1091,15 +1094,16 @@ def generate_response_stream(
             full_response += item
             yield f"data: {json.dumps({'type': 'token', 'content': item})}\n\n"
 
-    except Exception as e:
-        logger.error("LLM streaming error: %s", e)
-        yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+    except Exception:
+        # Full exception server-side only; the client gets a generic message (CWE-209).
+        logger.exception("LLM streaming error")
+        yield f"data: {json.dumps({'type': 'error', 'content': STREAM_ERROR_MESSAGE})}\n\n"
         return
 
     # Surface any error from the background thread.
     if llm_error:
-        logger.error("LLM streaming error: %s", llm_error[0])
-        yield f"data: {json.dumps({'type': 'error', 'content': str(llm_error[0])})}\n\n"
+        logger.error("LLM streaming error", exc_info=llm_error[0])
+        yield f"data: {json.dumps({'type': 'error', 'content': STREAM_ERROR_MESSAGE})}\n\n"
         return
 
     # ── Final timing summary ─────────────────────────────────

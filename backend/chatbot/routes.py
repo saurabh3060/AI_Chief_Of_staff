@@ -50,6 +50,10 @@ logger = get_agent_logger("chatbot")
 
 router = APIRouter(prefix="/chatbot", tags=["chatbot"])
 
+# The only error text a document stream ever sends to the client (CWE-209):
+# whatever the pipeline reports, the details stay in the server log.
+_DOC_STREAM_ERROR_MESSAGE = "Document search failed. Please try again later."
+
 # ── Global chatbot state ──────────────────────────────────────
 # Weaviate mode uses "wv_client"; "bm25" is the local keyword index
 # built from the same message set for re-ranking.
@@ -364,6 +368,12 @@ async def query_stream(
                             doc_sources = payload.get("sources", [])
                         elif ptype == "error":
                             had_error = True
+                            # Never forward upstream error text: re-emit a fixed message.
+                            chunk = (
+                                "data: "
+                                + json.dumps({"type": "error", "content": _DOC_STREAM_ERROR_MESSAGE})
+                                + "\n\n"
+                            )
                 except (json.JSONDecodeError, ValueError):
                     pass
                 yield chunk

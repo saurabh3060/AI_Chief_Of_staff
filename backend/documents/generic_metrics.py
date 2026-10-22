@@ -40,6 +40,30 @@ from core.utils import sanitize_log_input
 
 logger = get_agent_logger("chatbot")
 
+# ── Regex safety (CodeQL py/polynomial-redos) ─────────────────
+# User question text reaches the patterns below, so every pattern here uses
+# bounded repetition (no open-ended \s*, \w*, .+? next to another quantifier)
+# and the text is capped at MAX_REGEX_INPUT_LEN before matching. Real questions
+# are a few hundred characters; the bounds only matter for hostile input.
+MAX_REGEX_INPUT_LEN = 10000
+_MAX_WORD_LEN = 20       # longest word-like run matched after a month stem such as "apr"
+_MAX_GAP_LEN = 5         # longest run of whitespace between the parts of a phrase
+_MAX_WINDOW_LEN = 200    # longest period-window phrase captured by "between X and Y"
+# "ytd", "year to date" and an Apr-to-Nov style range.
+_YTD_RANGE_RE = re.compile(
+    r"(?i)\bytd\b|year.to.date|apr\w{0,%d}\s{0,%d}(?:-|–|to)\s{0,%d}nov"
+    % (_MAX_WORD_LEN, _MAX_GAP_LEN, _MAX_GAP_LEN)
+)
+# "between <window> and <window>"; the second window ends at ? . ! or end of line.
+_COMPARISON_WINDOWS_RE = re.compile(
+    r"(?i)\bbetween\s{1,%(gap)d}([^\n]{1,%(win)d}?)\s{1,%(gap)d}(?:and|vs\.?|versus)"
+    r"\s{1,%(gap)d}([^\n]{1,%(win)d}?)(?:[?.!]|$)" % {"gap": _MAX_GAP_LEN, "win": _MAX_WINDOW_LEN}
+)
+# A half-year token such as "H1" / "h 2" (the caller strips the text first).
+_HALF_YEAR_RE = re.compile(r"(?i)h\s{0,%d}([12])" % _MAX_GAP_LEN)
+# Lead-in phrase of a "what is X" style question; X is whatever follows it.
+_ASKED_PREFIX_RE = re.compile(r"\b(?:what is|what was|what were|give me|show me|tell me)\s")
+
 
 ENGINE_VERSION = 1
 BUSINESS_WORKBOOKS = {
@@ -1961,10 +1985,11 @@ def _json_object(raw) -> dict:
 def _question_scopes(question: str) -> set[str]:
     scopes=set(); found=period_parser.find_all(question)
     kinds={period.kind for period,_ in found}
-    if "Q" in kinds or re.search(r"(?i)\bq[1-4]\b",question): scopes.add("Q")
+    capped=question[:MAX_REGEX_INPUT_LEN]
+    if "Q" in kinds or re.search(r"(?i)\bq[1-4]\b",capped): scopes.add("Q")
     if "FY" in kinds and "Q" not in scopes: scopes.add("FY")
     if (("M" in kinds and len({period.label for period,_ in found})>=2)
-            or re.search(r"(?i)\bytd\b|year.to.date|apr\w*\s*(?:-|–|to)\s*nov",question)):
+            or _YTD_RANGE_RE.search(capped)):
         scopes.update(("RANGE","YTD"))
     elif "M" in kinds: scopes.add("M")
     return scopes
@@ -2244,15 +2269,13 @@ def _extremum_directions(question: str) -> list[tuple[str, str]]:
 
 def _comparison_windows(question: str) -> list[str]:
     """Two period-window phrases from wording such as 'between H1 and Oct-Feb'."""
-    match=re.search(
-        r"(?i)\bbetween\s+(.+?)\s+(?:and|vs\.?|versus)\s+(.+?)(?:[?.!]|$)",
-        question,
-    )
+    match=_COMPARISON_WINDOWS_RE.search(question[:MAX_REGEX_INPUT_LEN])
     return [match.group(1).strip(),match.group(2).strip()] if match else []
 
 
 def _window_months(text: str) -> set[int] | None:
-    half_match=re.fullmatch(r"(?i)\s*h\s*([12])\s*",text)
+    if len(text)>MAX_REGEX_INPUT_LEN: return None
+    half_match=_HALF_YEAR_RE.fullmatch(text.strip())
     if half_match:
         return set(range(4,10)) if half_match.group(1)=="1" else {10,11,12,1,2,3}
     named=period_parser.months_without_year(text)
@@ -2746,10 +2769,12 @@ async def resolve(conn, question: str, doc_ids=None, page: int | None = None, li
     # An exact catalogue-name lookup is authoritative.  Period discovery and runtime templates
     # are useful for natural-language questions, but they must not replace a rule when callers
     # ask for that rule by its registered name (the ingestion verifier does exactly this).
-    normalized_question=re.sub(r"\s+"," ",question.strip().lower())
-    asked_match=re.search(r"\b(?:what is|what was|what were|give me|show me|tell me)\s+(.+)$",
-                          normalized_question)
-    metric_phrase=(asked_match.group(1).strip(" ?.!") if asked_match else normalized_question)
+    normalized_question=re.sub(r"\s+"," ",question.strip().lower()[:MAX_REGEX_INPUT_LEN])
+    # Whitespace is already collapsed to single spaces, so the lead-in is followed by
+    # exactly one space and the metric phrase is simply the rest of the text.
+    asked_match=_ASKED_PREFIX_RE.search(normalized_question)
+    asked_phrase=normalized_question[asked_match.end():] if asked_match else ""
+    metric_phrase=(asked_phrase.strip(" ?.!") if asked_phrase else normalized_question)
 
     def explicitly_asked(metric_name: str) -> bool:
         name=re.sub(r"\s+"," ",(metric_name or "").strip().lower())

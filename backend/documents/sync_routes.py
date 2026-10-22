@@ -48,6 +48,23 @@ class SingleFileSyncRequest(BaseModel):
     )
 
 
+def _public_summary(summary):
+    """Copy of a sync summary that is safe to return to clients.
+
+    The orchestrator records one ``"<file>: <exception text>"`` string per
+    failure in ``summary["errors"]``; those strings can carry internal paths,
+    URLs or driver messages (CWE-209), so only their count is returned
+    (``error_count``). The strings themselves stay in the server log.
+    """
+    if not isinstance(summary, dict):
+        return summary
+    public = {key: value for key, value in summary.items() if key != "errors"}
+    if "errors" in summary:
+        errors = summary["errors"]
+        public["error_count"] = len(errors) if isinstance(errors, (list, tuple)) else 0
+    return public
+
+
 # ── Routes ────────────────────────────────────────────────────
 
 @router.post("", status_code=202)
@@ -122,30 +139,36 @@ async def sync_single_file(
         )
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         # Log the full error server-side; return a generic message to the
         # client so internal details / stack traces are not exposed (CWE-209).
-        logger.error("[SHAREPOINT-SYNC] Single-file sync failed: %s", exc)
+        logger.exception("[SHAREPOINT-SYNC] Single-file sync failed")
         raise HTTPException(status_code=500, detail="Single-file sync failed.")
 
     # sync_single_file() embeds the raw exception string in result["error"]
-    # on failure. Strip it before returning so internal details / stack
-    # traces are never exposed to the client (CWE-209); the detail is
-    # already logged inside sync_single_file / the sync pipeline.
-    if isinstance(result, dict) and result.get("status") == "failed":
-        # Sanitize the user-controlled item_id before logging so CR/LF or
-        # other control characters cannot forge log entries (CWE-117).
-        logger.error(
-            "[SHAREPOINT-SYNC] Single-file sync failed for item %s: %s",
-            sanitize_log_value(body.item_id),
-            sanitize_log_value(result.get("error")),
-        )
-        result = {
-            "status": "failed",
+    # on failure. Only fields that are safe to show are copied into the
+    # response, so that text can never reach the client (CWE-209); the detail
+    # is logged here and inside the sync pipeline.
+    if isinstance(result, dict) and result.get("status") == "success":
+        return {
+            "status": "success",
+            "doc_id": result.get("doc_id"),
             "name": result.get("name", ""),
-            "error": "Single-file sync failed.",
         }
-    return result
+
+    failed = result if isinstance(result, dict) else {}
+    # Sanitize the user-controlled item_id before logging so CR/LF or
+    # other control characters cannot forge log entries (CWE-117).
+    logger.error(
+        "[SHAREPOINT-SYNC] Single-file sync failed for item %s: %s",
+        sanitize_log_value(body.item_id),
+        sanitize_log_value(failed.get("error")),
+    )
+    return {
+        "status": "failed",
+        "name": failed.get("name", ""),
+        "error": "Single-file sync failed.",
+    }
 
 
 @router.get("/status")
@@ -168,9 +191,9 @@ async def sync_status():
         ),
         "last_sync_at": state.get("last_sync_at"),
         "last_sync_status": state.get("last_sync_status"),
-        "last_sync_summary": state.get("last_sync_summary"),
+        "last_sync_summary": _public_summary(state.get("last_sync_summary")),
         "tracked_files": len(state.get("files", {})),
-        "last_run_result": sharepoint_sync.last_sync_result(),
+        "last_run_result": _public_summary(sharepoint_sync.last_sync_result()),
     }
 
 
@@ -217,8 +240,5 @@ async def _run_sync_background(force: bool, bearer_token: str | None = None) -> 
             "[SHAREPOINT-SYNC] Background sync complete: %s",
             result,
         )
-    except Exception as exc:
-        logger.error(
-            "[SHAREPOINT-SYNC] Background sync failed: %s",
-            exc,
-        )
+    except Exception:
+        logger.exception("[SHAREPOINT-SYNC] Background sync failed")
