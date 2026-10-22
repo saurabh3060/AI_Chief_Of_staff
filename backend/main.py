@@ -12,7 +12,7 @@ Responsible for:
 Run locally with:
     uvicorn main:app --host 0.0.0.0 --port 8516
 """
-# Test change: offline Git sync workflow
+# Comment-only change used to verify the Git push/pull workflow; no runtime effect.
 
 import asyncio
 from contextlib import asynccontextmanager
