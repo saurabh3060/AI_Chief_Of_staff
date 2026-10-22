@@ -13,6 +13,7 @@ Run locally with:
     uvicorn main:app --host 0.0.0.0 --port 8516
 """
 # Comment-only change used to verify the Git push/pull workflow; no runtime effect.
+# Second sync check: this line round-trips between the dev PC and the server.
 
 import asyncio
 from contextlib import asynccontextmanager
