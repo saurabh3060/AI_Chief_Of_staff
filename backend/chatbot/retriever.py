@@ -743,19 +743,55 @@ _COLUMN_END_RE = re.compile(r"actual|plan|projection|achieve|growth|leverag|targ
 # What a column (or a question) is about, besides its period.
 _COLUMN_KIND_PATTERNS = {
     "actual": re.compile(r"actual", re.IGNORECASE),
-    "plan": re.compile(r"\bplan\b|\btarget\b|\bbudget\b", re.IGNORECASE),
+    "plan": re.compile(r"\bplan\b|\btarget\b", re.IGNORECASE),
+    "budget": re.compile(r"\bbudget\b", re.IGNORECASE),
+    "ytd": re.compile(r"\bytd\b", re.IGNORECASE),
+    "mtd": re.compile(r"\bmtd\b", re.IGNORECASE),
+    "h1": re.compile(r"\bh1\b", re.IGNORECASE),
+    "h2": re.compile(r"\bh2\b", re.IGNORECASE),
+    "q1": re.compile(r"\bq(?:tr)?\s*1\b", re.IGNORECASE),
+    "q2": re.compile(r"\bq(?:tr)?\s*2\b", re.IGNORECASE),
+    "q3": re.compile(r"\bq(?:tr)?\s*3\b", re.IGNORECASE),
+    "q4": re.compile(r"\bq(?:tr)?\s*4\b", re.IGNORECASE),
+    "fy": re.compile(r"\bfy\b|\bfy\s*['\u2019]?\d", re.IGNORECASE),
     "projection": re.compile(r"project", re.IGNORECASE),
     "gap": re.compile(r"\bgap\b", re.IGNORECASE),
-    "growth": re.compile(r"\byoy\b|growth|year[\s-]*on[\s-]*year", re.IGNORECASE),
+    "growth": re.compile(r"\b(?:yoy|y0y)\b|growth|year[\s-]*on[\s-]*year", re.IGNORECASE),
     "achievement": re.compile(r"achievement", re.IGNORECASE),
     "leveraged": re.compile(r"leverag", re.IGNORECASE),
 }
 _HEADER_GROUP_VIOLATION = 10   # cost of a group not starting at, or holding a second, start cell
 
 
+_BASE_THEN_ACHIEVEMENT_RE = re.compile(r"^(?:budget|plan|target)\s+achievement", re.IGNORECASE)
+_BARE_BASE_RE = re.compile(r"^(?:budget|plan|target)$", re.IGNORECASE)
+
+
 def _is_column_start(cell: str) -> bool:
     words = cell.split()
-    return bool(_PERIOD_CELL_RE.match(cell) or (words and words[0].lower() in _COLUMN_START_WORDS))
+    return bool(
+        _PERIOD_CELL_RE.match(cell) or _BASE_THEN_ACHIEVEMENT_RE.match(cell)
+        or (words and words[0].lower() in _COLUMN_START_WORDS)
+    )
+
+
+def _join_base_before_achievement(cells: list[str]) -> list[str]:
+    """A bare Budget / Plan cell that follows an "actuals" cell and precedes an
+    Achievement cell belongs to the Achievement column ("Budget" + "Achievement %"
+    -> "Budget Achievement %"), not to the actuals column before it."""
+    out: list[str] = []
+    i = 0
+    while i < len(cells):
+        if (
+            _BARE_BASE_RE.match(cells[i]) and out and re.search("actual", out[-1], re.IGNORECASE)
+            and i + 1 < len(cells) and cells[i + 1].lower().startswith("achievement")
+        ):
+            out.append(cells[i] + " " + cells[i + 1])
+            i += 2
+        else:
+            out.append(cells[i])
+            i += 1
+    return out
 
 
 def _group_header_cells(cells: list[str], n: int) -> list[list[str]] | None:
@@ -767,6 +803,10 @@ def _group_header_cells(cells: list[str], n: int) -> list[list[str]] | None:
     m = len(cells)
     if n < 1 or m < n:
         return None
+    if m > n:
+        joined = _join_base_before_achievement(cells)
+        if len(joined) >= n:
+            cells, m = joined, len(joined)
     if m == n:
         return [[c] for c in cells]
 
@@ -847,15 +887,26 @@ def _period_keys(text: str) -> set[str]:
 
 
 def _kinds(text: str) -> frozenset:
+    """Keywords (YTD, H1, Q1-Q4, FY, actual, plan, budget, projection, gap, growth,
+    achievement, leveraged) that a header or a question contains."""
+    text = text.replace("_", " ")
     return frozenset(k for k, pat in _COLUMN_KIND_PATTERNS.items() if pat.search(text))
 
 
+# Words that say what kind of figure is asked for, not which row: ignored when
+# matching a question to a row label ("Insurance fees" / "Insurance income" -> "Insurance").
+_ROW_FILLER = frozenset({
+    "fees", "fee", "income", "revenue", "actual", "actuals", "what", "was", "the", "from", "of",
+})
+
+
 def _best_rows(rows: list[tuple[str, list[str]]], q_words: set[str]) -> list[tuple[str, list[str]]]:
-    """The row(s) whose label words are all in the question; only the most
-    specific (most label words) are returned."""
+    """The row(s) whose label words (filler words ignored) are all in the question;
+    only the most specific (most label words) are returned."""
     scored = []
+    q_words = q_words - _ROW_FILLER
     for label, values in rows:
-        words = _question_words(label)
+        words = _question_words(label) - _ROW_FILLER
         if words and words <= q_words:
             scored.append((len(words), label, values))
     if not scored:
@@ -914,19 +965,31 @@ def _lookup_cell(
     None unless the column (and, for a lookup, the row) is unique. Cell text is
     copied exactly."""
     wanted = _kinds(question)
-    qperiods = _period_keys(question)
-    if not wanted or not qperiods:
+    if not wanted:
         return None
-    columns = [i for i, ps in enumerate(_column_periods(groups)) if qperiods & ps]
+    # With a period in the question only the columns of that period are candidates;
+    # without one every column is.
+    qperiods = _period_keys(question)
+    columns = (
+        [i for i, ps in enumerate(_column_periods(groups)) if qperiods & ps]
+        if qperiods else list(range(len(groups)))
+    )
     own = [_kinds(" ".join(g)) for g in groups]
-    # Match on keywords, most specific first: the question's full set of kinds, then
-    # only its derived kind (a gap / growth / achievement column is named by its own
-    # keyword; "gap to Plan" only says what it is relative to).
+    present = set().union(*(own[i] for i in columns)) if columns else set()
+    # Keyword match: a column qualifies when its header holds every question keyword
+    # that occurs in these headers; the one with the fewest other keywords wins
+    # ("YTD actual" -> "YTD Actuals", not "H1 actuals Budget"). Full set of keywords
+    # first, then only the derived kind (a gap / growth / achievement column is named
+    # by its own keyword; "gap to Plan" only says what it is relative to). A tie skips.
     derived = wanted & _DERIVED_KINDS
-    levels = [[i for i in columns if own[i] == wanted], [i for i in columns if wanted <= own[i]]]
-    if derived and derived != wanted:
-        levels += [[i for i in columns if own[i] == derived], [i for i in columns if derived <= own[i]]]
-    found = next((level for level in levels if level), [])
+    found: list[int] = []
+    for required in (wanted & present, derived & present if derived != wanted else set()):
+        qualified = [i for i in columns if required and required <= own[i]]
+        if not qualified:
+            continue
+        fewest = min(len(own[i] - wanted) for i in qualified)
+        found = [i for i in qualified if len(own[i] - wanted) == fewest]
+        break
     if len(found) != 1:
         return None
     idx, n = found[0], len(groups)
