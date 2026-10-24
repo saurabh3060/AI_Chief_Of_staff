@@ -64,6 +64,7 @@ from core.logging_config import get_agent_logger, sanitize_log_value
 
 from agent_email import cluster_publish_store as staging
 from agent_email.cluster_publish_store import NEW_CLUSTER, UPDATED_CLUSTER, ClusterStaging, StagingRow
+from agent_email.pipeline_metrics import PipelineMetricsCollector
 from agent_email.schema import ClusterEmailRef, EmailCandidate, EmailClusterRecord, EmailMessage
 from agent_email.semantic_match import cosine_similarity
 
@@ -276,7 +277,7 @@ class PublishSummary:
 
 
 class ClusterPublisher:
-    """One instance per pipeline invocation. Not thread-safe; run under the advisory lock."""
+    """One instance per pipeline invocation. Not thread-safe; run under the lease lock."""
 
     def __init__(self, settings: Settings | None = None, fetch_message: FetchMessage | None = None) -> None:
         self.settings = settings or get_settings()
@@ -290,6 +291,8 @@ class ClusterPublisher:
         self._published: dict[str, EmailClusterRecord] | None = None
         self._dept_index = None
         self._started = time.perf_counter()
+        self._synth_ok = 0       # the metrics collector overwrites, so keep running totals
+        self._synth_failed = 0
         self.summary = PublishSummary(run_id="")
 
     # -- lifecycle ---------------------------------------------------------
@@ -411,6 +414,9 @@ class ClusterPublisher:
             StagingRow(run_id, a.cluster_id, a.message_id, a.subject, a.action) for a in assignments
         ]
         inserted = await staging.insert_staging_rows(rows)
+        PipelineMetricsCollector.record_clustering(
+            len({r.cluster_id for r in rows}), algorithm=settings.email_cluster_algo,
+        )
         log_event(
             "staging_rows_created", run_id=run_id, count=len(rows), inserted=inserted,
             distinct_clusters=len({r.cluster_id for r in rows}),
@@ -791,7 +797,11 @@ class ClusterPublisher:
             record.action_items = "|".join(
                 f for f in (service._format_action_item(ai) for ai in merged.get("action_items", [])) if f
             )
+            self._synth_ok += 1
+            PipelineMetricsCollector.record_summarization(self._synth_ok, self._synth_failed)
             return
+        self._synth_failed += 1
+        PipelineMetricsCollector.record_summarization(self._synth_ok, self._synth_failed)
         if s.bu_email_pipeline_enabled:
             # Publishing an empty summary would hide the failure; retry instead.
             raise RuntimeError("cluster synthesis produced no usable output")
@@ -856,10 +866,10 @@ async def drain_pending(settings: Settings | None = None) -> PublishSummary | No
 
 
 async def run_with_lock(body: Callable[[], Awaitable[int]]) -> int:
-    """Run ``body`` only if no other publish run holds the advisory lock."""
-    async with staging.advisory_lock() as acquired:
+    """Run ``body`` only if no other publish run holds the lease lock."""
+    async with staging.run_lock() as acquired:
         if not acquired:
             log_event("run_skipped_locked", level=logging.WARNING,
-                      error="another cluster publish run holds the advisory lock")
+                      error="another cluster publish run holds the lock lease")
             return 0
         return await body()

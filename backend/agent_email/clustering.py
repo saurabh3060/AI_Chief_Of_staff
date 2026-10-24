@@ -130,11 +130,6 @@ def stems_share_series(
     return len(shared) / len(union) >= jaccard_min
 
 
-def _normalize_period_lookup_token(tok: str) -> str:
-    """Strip possessive suffix so ``june's`` resolves as ``june``."""
-    return re.sub(r"'s$", "", tok.lower().rstrip("'"))
-
-
 def _same_conversation(i: int, j: int, conversation_ids: list[str]) -> bool:
     cid_i = (conversation_ids[i] or "").strip()
     cid_j = (conversation_ids[j] or "").strip()
@@ -165,12 +160,33 @@ _MONTH_TO_NUM: dict[str, int] = {
     "nov": 11, "november": 11,
     "dec": 12, "december": 12,
 }
-# Quarter / half-year period tokens, canonicalized to themselves.
-_QUARTER_TOKENS = frozenset({"q1", "q2", "q3", "q4", "h1", "h2"})
+# Quarter / half-year period tokens (q1-q4, h1-h2), canonicalized to themselves.
 # A 2- or 4-digit year appearing next to a period token ("May 2026",
 # "May-26", "FY26"). Bare years are only trusted when adjacent to a
 # period token, so an arbitrary number in a subject is never a year.
-_YEAR_RE = re.compile(r"\b(20\d{2}|'?\d{2})\b")
+_QUARTER_RE = re.compile(r"(?<![a-z0-9])(q[1-4]|h[12])(?![a-z0-9])")
+# Separators allowed between a period token and its year: space ' ’ . _ / - ,
+# (deliberately NOT "|" or ":", which separate unrelated parts of a subject).
+_YEAR_SEP = r"[\s'’._/\-,]*"
+_YEAR_AFTER_RE = re.compile(_YEAR_SEP + r"(20\d{2}|\d{2})(?!\d)")
+_YEAR_AFTER_FY_RE = re.compile(_YEAR_SEP + r"(?:fy" + _YEAR_SEP + r")?(20\d{2}|\d{2})(?!\d)")
+_YEAR_BEFORE_RE = re.compile(r"(?:(?:fy)?" + _YEAR_SEP + r"(20\d{2})|fy" + _YEAR_SEP + r"(\d{2}))" + _YEAR_SEP + r"$")
+
+
+def _adjacent_year(before: str, after: str, allow_fy: bool) -> str | None:
+    """Year text written directly after (or, if 4-digit / FY-prefixed, before) a period token.
+
+    A 2-digit number directly AFTER the token is a year ("Sept 25" = Sept 2025).
+    A bare 2-digit number BEFORE it is never a year ("25 Sept" is a day,
+    "Branch 25 Sept" is not 2025), so only a 4-digit or FYnn year is accepted there.
+    """
+    m = (_YEAR_AFTER_FY_RE if allow_fy else _YEAR_AFTER_RE).match(after)
+    if m:
+        return m.group(1)
+    m = _YEAR_BEFORE_RE.search(before)
+    if m:
+        return m.group(1) or (m.group(2) if allow_fy else None)
+    return None
 
 
 def _normalize_year(raw: str, fallback_year: int | None) -> int | None:
@@ -214,33 +230,33 @@ def series_period_token(
         share a received month).
     """
     cleaned = normalize_subject(subject).lower()
-    tokens = re.findall(r"[a-z0-9']+", cleaned)
 
     recv_year = received_at.year if received_at is not None else None
     recv_month = received_at.month if received_at is not None else None
 
-    # 1) Explicit month name anywhere in the subject.
+    # 1) Explicit month name anywhere in the subject. Matching on letter runs
+    # (not whitespace tokens) makes "Sep26", "Sept'26", "Sep-26" and "Sept 26"
+    # all resolve the same way; the first month named wins.
     month_num: int | None = None
-    for tok in tokens:
-        lookup = _normalize_period_lookup_token(tok)
-        if lookup in _MONTH_TO_NUM:
-            month_num = _MONTH_TO_NUM[lookup]
+    year_text: str | None = None
+    for m in re.finditer(r"[a-z]+", cleaned):
+        if m.group(0) in _MONTH_TO_NUM:
+            month_num = _MONTH_TO_NUM[m.group(0)]
+            year_text = _adjacent_year(cleaned[:m.start()], cleaned[m.end():], allow_fy=False)
             break
 
     # 2) Explicit quarter/half token (only used if no month is named).
     quarter_tok: str = ""
     if month_num is None:
-        for tok in tokens:
-            lookup = _normalize_period_lookup_token(tok)
-            if lookup in _QUARTER_TOKENS:
-                quarter_tok = lookup
-                break
+        qm = _QUARTER_RE.search(cleaned)
+        if qm:
+            quarter_tok = qm.group(1)
+            year_text = _adjacent_year(cleaned[:qm.start()], cleaned[qm.end():], allow_fy=True)
 
-    # Year: first year-like token in the subject, else received year.
-    year: int | None = None
-    ymatch = _YEAR_RE.search(cleaned)
-    if ymatch:
-        year = _normalize_year(ymatch.group(1), recv_year)
+    # Year: only one written right next to the month/quarter, else the received
+    # year. Any other number in the subject ("Top 15 reports") is not a year.
+    year: int | None = _normalize_year(year_text, recv_year) if year_text else None
+    explicit_year = year is not None
     if year is None:
         year = recv_year
 
@@ -249,7 +265,7 @@ def series_period_token(
         # of the received month (a period referenced in arrears that
         # arrives early the next year). Only applies when we fell back to
         # the received year (no explicit year in the subject).
-        if year is not None and ymatch is None and recv_month is not None:
+        if year is not None and not explicit_year and recv_month is not None:
             if month_num - recv_month >= 6:
                 year -= 1
         return f"{year:04d}-{month_num:02d}" if year is not None else f"m{month_num:02d}"

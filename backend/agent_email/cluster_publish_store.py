@@ -16,13 +16,15 @@ Safety properties
   after a crash is a no-op and never resets ``retry_count``.
 * ``delete_cluster_rows`` is the only delete, and it is scoped to exactly
   one ``(run_id, cluster_id)``. Nothing here deletes pending work in bulk.
-* ``try_advisory_lock`` gives single-writer semantics across processes.
+* ``run_lock`` gives single-writer semantics across processes (lease row +
+  heartbeat; safe behind a connection pooler, unlike session advisory locks).
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -39,8 +41,10 @@ STAGING_TABLE = "cluster_publish_staging"
 NEW_CLUSTER = "NEW_CLUSTER"
 UPDATED_CLUSTER = "UPDATED_CLUSTER"
 
-# Arbitrary constant: pg_try_advisory_lock key for "one publish run at a time".
-_ADVISORY_LOCK_KEY = 0x434C5055  # "CLPU"
+LOCK_TABLE = "cluster_publish_lock"
+_LOCK_NAME = "cluster_publish"
+_LEASE_SECONDS = 300      # a crashed run blocks the next one for at most this long
+_HEARTBEAT_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -78,24 +82,67 @@ def _pool():
 
 
 @asynccontextmanager
-async def advisory_lock():
-    """Hold the publish-run advisory lock; yields False if another run has it.
+async def run_lock():
+    """Single-writer lease for one publish run; yields False if another run holds it.
 
-    The lock lives on a dedicated connection for the whole run and is
-    released explicitly (and implicitly if the connection dies), so a crashed
-    process can never wedge future runs.
+    A row in ``cluster_publish_lock`` with an expiry, renewed by a heartbeat
+    every ``_HEARTBEAT_SECONDS``. Unlike a session-level advisory lock this is
+    safe behind a connection pooler (PgBouncer / RDS Proxy) and across idle
+    connection drops, because every statement is independent. If the process
+    dies, the lease simply expires after ``_LEASE_SECONDS`` and the next run
+    takes over.
     """
     pool = _pool()
+    holder = uuid.uuid4().hex
     async with pool.acquire() as conn:
-        acquired = bool(await conn.fetchval("SELECT pg_try_advisory_lock($1)", _ADVISORY_LOCK_KEY))
+        got = await conn.fetchval(
+            f"""
+            INSERT INTO {LOCK_TABLE} (lock_name, holder, expires_at)
+            VALUES ($1, $2, now() + make_interval(secs => $3))
+            ON CONFLICT (lock_name) DO UPDATE
+               SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
+             WHERE {LOCK_TABLE}.expires_at < now()
+            RETURNING holder
+            """,
+            _LOCK_NAME, holder, float(_LEASE_SECONDS),
+        )
+    acquired = got == holder
+    heartbeat = asyncio.create_task(_heartbeat(holder)) if acquired else None
+    try:
+        yield acquired
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+        if acquired:
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        f"DELETE FROM {LOCK_TABLE} WHERE lock_name = $1 AND holder = $2",
+                        _LOCK_NAME, holder,
+                    )
+            except Exception as exc:  # noqa: BLE001 - lease expiry covers a failed release
+                logger.warning("[CLUSTER-PUBLISH] lock release failed (lease will expire): %s",
+                               sanitize_log_value(repr(exc)))
+
+
+async def _heartbeat(holder: str) -> None:
+    while True:
+        await asyncio.sleep(_HEARTBEAT_SECONDS)
         try:
-            yield acquired
-        finally:
-            if acquired:
-                try:
-                    await conn.execute("SELECT pg_advisory_unlock($1)", _ADVISORY_LOCK_KEY)
-                except Exception as exc:  # noqa: BLE001 - connection teardown also releases it
-                    logger.warning("[CLUSTER-PUBLISH] advisory unlock failed: %s", sanitize_log_value(repr(exc)))
+            async with _pool().acquire() as conn:
+                status = await conn.execute(
+                    f"UPDATE {LOCK_TABLE} SET expires_at = now() + make_interval(secs => $3) "
+                    f"WHERE lock_name = $1 AND holder = $2",
+                    _LOCK_NAME, holder, float(_LEASE_SECONDS),
+                )
+            if status.rsplit(" ", 1)[-1] == "0":
+                logger.error("[CLUSTER-PUBLISH] lock lease lost; another run may have taken over")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep beating; a transient error must not kill the run
+            logger.warning("[CLUSTER-PUBLISH] lock heartbeat failed: %s", sanitize_log_value(repr(exc)))
 
 
 # ---------------------------------------------------------------------------

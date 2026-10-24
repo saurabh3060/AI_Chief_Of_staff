@@ -146,6 +146,17 @@ EMAIL_TABLE_DDL: list[tuple[str, str]] = [
         """,
     ),
     (
+        # Single-writer lease for the publish flow (cluster_publish_store.run_lock).
+        "cluster_publish_lock",
+        """
+        CREATE TABLE IF NOT EXISTS cluster_publish_lock (
+            lock_name  TEXT PRIMARY KEY,
+            holder     TEXT NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL
+        );
+        """,
+    ),
+    (
         "email_topics",
         """
         CREATE TABLE IF NOT EXISTS email_topics (

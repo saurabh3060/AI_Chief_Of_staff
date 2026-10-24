@@ -469,3 +469,112 @@ def test_complete_linkage_avoids_bridge_chaining():
     bridge_cluster = next(g for g in agg_groups if 6 in g)
     assert {0, 1, 2} <= set(bridge_cluster) or {3, 4, 5} <= set(bridge_cluster)
 
+
+
+# ---------------------------------------------------------------------------
+# Apostrophe-year month tokens ("Sept'26") are recognized as a period
+# ---------------------------------------------------------------------------
+
+def test_apostrophe_year_subjects_resolve_to_a_month():
+    from datetime import datetime, timezone
+
+    from agent_email.clustering import series_occurrence_key, series_period_token
+
+    recv = datetime(2026, 10, 5, tzinfo=timezone.utc)
+    for subject, expected in [
+        ("BBRL Business Data | Sept'26", "2026-09"),
+        ("BBRL Business Data | Sep'26", "2026-09"),
+        ("BBRL Business Data | Oct'26", "2026-10"),
+        ("BBRL Business Data | Sept'2026", "2026-09"),
+        ("RE: BBRL Business Data | Sept'26", "2026-09"),
+        ("Pack | Q3'26", "2026-q3"),
+    ]:
+        assert series_period_token(subject, recv, require_explicit=True) == expected, subject
+
+    sept = series_occurrence_key("BBRL Business Data | Sept'26", recv)
+    assert sept == series_occurrence_key("BBRL Business Data | Sept 26", recv) == "bbrl+business+data|2026-09"
+    assert sept != series_occurrence_key("BBRL Business Data | Oct'26", recv)
+
+
+def test_period_parsing_unchanged_for_existing_forms():
+    from datetime import datetime, timezone
+
+    from agent_email.clustering import series_period_token
+
+    recv = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    assert series_period_token("Actions from June's WB Review", recv, require_explicit=True) == "2026-06"
+    assert series_period_token("MoM - May 2026", recv, require_explicit=True) == "2026-05"
+    assert series_period_token("Sep-26 CA/SA targets", recv, require_explicit=True) == "2026-09"
+    assert series_period_token("Weekly working paper", recv, require_explicit=True) == ""
+
+
+def test_apostrophe_year_months_of_one_series_split_into_separate_clusters():
+    """Sept'26 and Oct'26 mails of one series must not stay merged in a single cluster."""
+    from datetime import datetime, timezone
+
+    import numpy as np
+
+    from agent_email.clustering import cluster_candidates
+
+    settings = type("S", (), {
+        "email_cluster_algo": "agglomerative",
+        "email_cluster_similarity_threshold": 0.75,
+        "email_cluster_series_near_miss": 0.68,
+        "email_cluster_series_jaccard": 0.5,
+        "email_cluster_residual_threshold": 0.0,
+        "email_cluster_cite_min_cosine": 0.0,
+        "meeting_anchored_clustering_enabled": True,
+        "bu_departments": [],
+    })()
+    same = np.array([1.0, 0.0], dtype=np.float32)
+    groups = cluster_candidates(
+        [same, same],
+        settings=settings,
+        subjects=["BBRL Business Data | Sept'26", "BBRL Business Data | Oct'26"],
+        bodies=["", ""],
+        meeting_ids=["", ""],
+        received_ats=[datetime(2026, 10, 5, tzinfo=timezone.utc)] * 2,
+        conversation_ids=["a", "b"],
+    )
+    assert sorted(map(tuple, groups)) == [(0,), (1,)]
+
+
+# ---------------------------------------------------------------------------
+# Year is only taken when written next to the month/quarter
+# ---------------------------------------------------------------------------
+
+def test_period_year_is_bound_to_the_period_token_not_any_number():
+    from datetime import datetime, timezone
+
+    from agent_email.clustering import series_period_token
+
+    recv = datetime(2026, 10, 5, tzinfo=timezone.utc)
+    cases = [
+        # other numbers in the subject are not years
+        ("Top 15 reports | Sept", "2026-09"),
+        ("Branch 25 review | Sept", "2026-09"),
+        ("Phase 12 update - Sept", "2026-09"),
+        ("25 Sept review", "2026-09"),                 # 2-digit BEFORE the month is a day
+        # a 2-digit number right AFTER the month is always a year
+        ("Review | Sept 25", "2025-09"),
+        ("Review | Sep 24", "2024-09"),
+        ("Review | Sept 26", "2026-09"),
+        # glued / differently punctuated years
+        ("BBRL Business Data | Sep26", "2026-09"),
+        ("BBRL Business Data | Sept.26", "2026-09"),
+        ("BBRL Business Data | Sep_26", "2026-09"),
+        # explicit years win, before or after the month
+        ("Review | Sept 2025", "2025-09"),
+        ("26 Sept 2026 review", "2026-09"),
+        ("2026 Sept review", "2026-09"),
+        # quarters
+        ("Top 15 pack | Q3", "2026-q3"),
+        ("Pack | Q3'25", "2025-q3"),
+        ("FY26 Q3 pack", "2026-q3"),
+        ("Update | Q3 2026", "2026-q3"),
+        # not months
+        ("Marketing review", ""),
+        ("Data | Sepa", ""),
+    ]
+    for subject, expected in cases:
+        assert series_period_token(subject, recv, require_explicit=True) == expected, subject

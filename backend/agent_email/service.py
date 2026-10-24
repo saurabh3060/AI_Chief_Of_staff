@@ -632,7 +632,7 @@ async def run_email_cluster_pipeline(
     """
     Entry point. With EMAIL_CLUSTER_INCREMENTAL_PUBLISH_ENABLED off (default)
     this is exactly the original pipeline. With it on, the same pipeline runs
-    under a single-writer advisory lock and publishes through the staging
+    under a single-writer lease lock and publishes through the staging
     table (see agent_email/cluster_publish.py).
     """
     active_settings = settings or get_settings()
