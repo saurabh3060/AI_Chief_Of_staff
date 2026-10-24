@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from core.config import Settings, get_settings
+from core.config import IST, Settings, get_settings
 from core.graph_client.client import GraphClient
 from core.logging_config import get_agent_logger
 from core.ollama_client.client import OllamaClient
@@ -630,6 +630,28 @@ async def run_email_cluster_pipeline(
     token_provider=None,
 ) -> int:
     """
+    Entry point. With EMAIL_CLUSTER_INCREMENTAL_PUBLISH_ENABLED off (default)
+    this is exactly the original pipeline. With it on, the same pipeline runs
+    under a single-writer advisory lock and publishes through the staging
+    table (see agent_email/cluster_publish.py).
+    """
+    active_settings = settings or get_settings()
+    if not active_settings.email_cluster_incremental_publish_enabled:
+        return await _run_email_cluster_pipeline_impl(bearer_token, active_settings, token_provider)
+
+    from agent_email import cluster_publish
+
+    return await cluster_publish.run_with_lock(
+        lambda: _run_email_cluster_pipeline_impl(bearer_token, active_settings, token_provider)
+    )
+
+
+async def _run_email_cluster_pipeline_impl(
+    bearer_token: str | None = None,
+    settings: Settings | None = None,
+    token_provider=None,
+) -> int:
+    """
     Full cluster synthesis pipeline: fetch -> relevance filter -> embed ->
     cluster -> synthesize -> write email_clusters (incremental append).
 
@@ -657,6 +679,20 @@ async def run_email_cluster_pipeline(
         active_settings.weaviate_grpc_host, active_settings.weaviate_grpc_port,
     )
 
+    # Incremental publish mode: finish any incomplete staged work from a
+    # previous run BEFORE fetching or considering a single new email.
+    publisher = None
+    if active_settings.email_cluster_incremental_publish_enabled:
+        from agent_email.cluster_publish import ClusterPublisher
+
+        async def _fetch_message(message_id: str) -> EmailMessage | None:
+            raw = await client.get_message_detail(message_id, bearer_token=bearer_token)
+            return _parse_message(raw) if raw else None
+
+        publisher = ClusterPublisher(active_settings, fetch_message=_fetch_message)
+        await publisher.begin()
+        await publisher.resume_pending()
+
     # -----------------------------------------------------------------
     # Start-of-run scoped rebuild of the rebuildable copies.
     #
@@ -674,23 +710,27 @@ async def run_email_cluster_pipeline(
     #     lazily on demand.
     # Best-effort: both helpers are non-fatal, because the pipeline's own
     # writes later in the run re-mirror vectors and refresh the cache.
-    try:
-        from agent_email.weaviate_sync import clear_and_restore_weaviate_from_postgres
-        await clear_and_restore_weaviate_from_postgres(settings=active_settings)
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "[PIPELINE run=%s] Weaviate scoped rebuild failed (continuing): %s",
-            run_id, exc,
-        )
-    if getattr(active_settings, "redis_enabled", False):
+    #
+    # Skipped in incremental publish mode: that mode syncs only the changed
+    # delta per published cluster instead of wiping and refilling everything.
+    if publisher is None:
         try:
-            from agent_email import redis_cache
-            await redis_cache.clear_and_refill_from_source(settings=active_settings)
+            from agent_email.weaviate_sync import clear_and_restore_weaviate_from_postgres
+            await clear_and_restore_weaviate_from_postgres(settings=active_settings)
         except Exception as exc:  # noqa: BLE001
             logger.error(
-                "[PIPELINE run=%s] Redis scoped rebuild failed (continuing): %s",
+                "[PIPELINE run=%s] Weaviate scoped rebuild failed (continuing): %s",
                 run_id, exc,
             )
+        if getattr(active_settings, "redis_enabled", False):
+            try:
+                from agent_email import redis_cache
+                await redis_cache.clear_and_refill_from_source(settings=active_settings)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "[PIPELINE run=%s] Redis scoped rebuild failed (continuing): %s",
+                    run_id, exc,
+                )
 
     lookback_days = active_settings.resolved_email_fetch_lookback_days
     received_after: str | None = None
@@ -713,6 +753,8 @@ async def run_email_cluster_pipeline(
     
     if not raw_messages:
         logger.info("[PIPELINE run=%s] no emails fetched; pipeline complete", run_id)
+        if publisher is not None:
+            await publisher.finish()
         PipelineMetricsCollector.end_run("completed")
         from agent_email.pipeline_freshness import mark_pipeline_complete
         mark_pipeline_complete()
@@ -835,6 +877,8 @@ async def run_email_cluster_pipeline(
     )
     if not candidates:
         logger.info("[POOL-SCORE run=%s] no candidates after relevance filter", run_id)
+        if publisher is not None:
+            await publisher.finish()
         PipelineMetricsCollector.record_candidate_retrieval(len(messages), 0)
         try:
             prepared = await prepare_stored_meeting_matches(active_settings)
@@ -866,6 +910,25 @@ async def run_email_cluster_pipeline(
         await assign_candidates_to_meetings(
             candidates, vectors, settings=active_settings, run_id=run_id, run_now=run_now,
         )
+
+    if publisher is not None:
+        # Incremental publish: stage only genuinely new emails (decided by the
+        # same cluster_candidates rules) and publish cluster-by-cluster.
+        await publisher.publish_new(candidates, vectors)
+        summary = await publisher.finish()
+        try:
+            prepared = await prepare_stored_meeting_matches(active_settings)
+            logger.info("[MEETING-MATCH run=%s] stored %d prepared brief(s) in Redis", run_id, prepared)
+        except Exception as exc:  # noqa: BLE001
+            from core.logging_config import sanitize_log_value
+
+            logger.error(
+                "[MEETING-MATCH run=%s] preparing briefs failed: %s", run_id, sanitize_log_value(repr(exc)),
+            )
+        PipelineMetricsCollector.end_run("completed")
+        from agent_email.pipeline_freshness import mark_pipeline_complete
+        mark_pipeline_complete()
+        return len(summary.processed)
 
     meeting_ids = [c.meeting_id for c in candidates]
     index_groups = cluster_candidates(
@@ -995,6 +1058,7 @@ async def run_email_cluster_pipeline(
             meeting_start=cluster_meeting_start,
             meeting_end=cluster_meeting_end,
             updated_at=datetime.now(timezone.utc).isoformat(),
+            run_id=run_id,
         ))
         pending.append((indices, assigned_dept, cluster_meeting_id))
         written = await store.write_cluster_records(cluster_records, settings=active_settings)
@@ -1550,15 +1614,15 @@ async def refresh_meeting_history(
 
     lookback_days = int(active_settings.meeting_history_lookback_days or 60)
     fetch_top = int(active_settings.meeting_history_fetch_top or 250)
-    window_start = now - timedelta(days=lookback_days)
-    # End the window at the run time itself, NOT end-of-today. Pulling through
-    # end of today swept in today's not-yet-started calendar events and let
-    # them be treated as PAST meetings for anchoring. Ending at `now` keeps the
-    # historical pool to genuinely-past occurrences only.
-    window_end = now
+    today_start_ist = now.astimezone(IST).replace(hour=0, minute=0, second=0, microsecond=0)
+    window_end = today_start_ist.astimezone(timezone.utc)
+    window_start = window_end - timedelta(days=lookback_days)
+    # Historical anchoring is previous days only. Today's meetings are handled
+    # by get_todays_events() + meeting_embeddings, so an earlier-today meeting
+    # cannot become "past history" for a later-today email.
 
     logger.info(
-        "[MEETING-HISTORY] one calendar pull, past %d day(s) up to run time: %s -> %s (top=%d)",
+        "[MEETING-HISTORY] one calendar pull, previous %d day(s) ending at start of today IST: %s -> %s (top=%d)",
         lookback_days, window_start.isoformat(), window_end.isoformat(), fetch_top,
     )
 
@@ -1575,7 +1639,42 @@ async def refresh_meeting_history(
         return 0
 
     raw_events = raw_response.get("value", [])
-    logger.info("[MEETING-HISTORY] fetched %d raw occurrence(s)", len(raw_events))
+
+    today_ist_date = today_start_ist.date()
+
+    def _is_before_today_ist(event: dict) -> bool:
+        raw_start = str((event.get("start") or {}).get("dateTime") or "").strip()
+        if not raw_start:
+            return True
+        try:
+            raw = raw_start
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            if "." in raw:
+                date_part, frac_part = raw.split(".", 1)
+                tz_part = ""
+                for marker in ("+", "-"):
+                    if marker in frac_part:
+                        frac_part, tz_part = frac_part.split(marker, 1)
+                        tz_part = marker + tz_part
+                        break
+                raw = f"{date_part}.{frac_part[:6]}{tz_part}"
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                tz_name = str((event.get("start") or {}).get("timeZone") or "").strip()
+                parsed = parsed.replace(tzinfo=IST if tz_name == "India Standard Time" else timezone.utc)
+            return parsed.astimezone(IST).date() < today_ist_date
+        except Exception:  # noqa: BLE001
+            # Preserve hard-to-parse historical rows rather than dropping data.
+            return True
+
+    before_filter = len(raw_events)
+    raw_events = [event for event in raw_events if _is_before_today_ist(event)]
+    logger.info(
+        "[MEETING-HISTORY] fetched %d raw occurrence(s); kept %d before today IST "
+        "(excluded_today=%d)",
+        before_filter, len(raw_events), before_filter - len(raw_events),
+    )
 
     existing = await store.read_meeting_history(settings=active_settings)
     records_by_id: dict[str, dict[str, str]] = dict(existing)

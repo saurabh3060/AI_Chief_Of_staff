@@ -248,6 +248,24 @@ async def run_full_pipeline(settings) -> int:
             bearer_token=bearer_token, settings=settings
         )
         print(f"Pipeline complete: persisted {written} cluster record(s).")
+
+        # Incremental publish caps clusters per run, so after a full wipe the
+        # first run leaves the rest staged. Drain it here (no re-fetch).
+        if settings.email_cluster_incremental_publish_enabled:
+            from agent_email import cluster_publish, cluster_publish_store as staging
+
+            remaining = await staging.remaining_rows()
+            while remaining:
+                summary = await cluster_publish.drain_pending(settings)
+                now_remaining = await staging.remaining_rows()
+                if summary is None or now_remaining >= remaining:
+                    print(f"WARNING: {now_remaining} staged row(s) could not be published "
+                          "(failed/exhausted clusters or lock held); see logs.")
+                    return 1
+                written += len(summary.processed)
+                remaining = now_remaining
+                print(f"Drained batch: {len(summary.processed)} cluster(s); {remaining} staged row(s) left.")
+            print(f"Incremental publish drained: {written} cluster(s) total.")
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: pipeline run failed: {type(exc).__name__}: {exc}")

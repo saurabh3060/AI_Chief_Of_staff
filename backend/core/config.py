@@ -242,6 +242,46 @@ class Settings(BaseSettings):
         alias="EMAIL_CLUSTER_MAX_SIZE",
         validation_alias="EMAIL_CLUSTER_MAX_SIZE",
     )
+    # ---- Incremental, retry-safe cluster publish (agent_email/cluster_publish.py) ----
+    # Master switch. OFF keeps the original rebuild-everything pipeline
+    # byte-for-byte; ON stages each new email per affected cluster in
+    # `cluster_publish_staging` and publishes cluster-by-cluster.
+    email_cluster_incremental_publish_enabled: bool = Field(
+        default=False,
+        alias="EMAIL_CLUSTER_INCREMENTAL_PUBLISH_ENABLED",
+        validation_alias="EMAIL_CLUSTER_INCREMENTAL_PUBLISH_ENABLED",
+    )
+    # If a run stages MORE distinct clusters than this, or MORE distinct new
+    # emails than `email_cluster_max_new_emails`, it is processed in
+    # batches of `email_cluster_max_clusters_per_run` instead of all at once.
+    email_cluster_max_affected_clusters: int = Field(
+        default=50,
+        ge=1,
+        alias="EMAIL_CLUSTER_MAX_AFFECTED_CLUSTERS",
+        validation_alias="EMAIL_CLUSTER_MAX_AFFECTED_CLUSTERS",
+    )
+    email_cluster_max_new_emails: int = Field(
+        default=200,
+        ge=1,
+        alias="EMAIL_CLUSTER_MAX_NEW_EMAILS",
+        validation_alias="EMAIL_CLUSTER_MAX_NEW_EMAILS",
+    )
+    # Cluster budget for one invocation once a threshold above is exceeded.
+    # Unprocessed clusters stay staged for the next run.
+    email_cluster_max_clusters_per_run: int = Field(
+        default=25,
+        ge=1,
+        alias="EMAIL_CLUSTER_MAX_CLUSTERS_PER_RUN",
+        validation_alias="EMAIL_CLUSTER_MAX_CLUSTERS_PER_RUN",
+    )
+    # A cluster whose staged rows have failed this many times is no longer
+    # retried (its rows are kept for inspection and an alert is logged).
+    email_cluster_max_staging_retries: int = Field(
+        default=3,
+        ge=1,
+        alias="EMAIL_CLUSTER_MAX_STAGING_RETRIES",
+        validation_alias="EMAIL_CLUSTER_MAX_STAGING_RETRIES",
+    )
     # Department assignment: if the top two prototype scores (0-100)
     # differ by this much or less, break the tie with token overlap
     # against each department's own dictionary text. 0 = never tie-break.

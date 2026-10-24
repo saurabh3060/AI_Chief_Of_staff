@@ -69,6 +69,7 @@ _STATIC_OWNED_TABLES = [
     "meeting_history",
     "meeting_notes",
     "email_summaries",
+    "cluster_publish_staging",
     "tracker_item_overrides",
     "tracker_completed_items",
     "tracker_deleted_items",

@@ -121,6 +121,31 @@ EMAIL_TABLE_DDL: list[tuple[str, str]] = [
         """,
     ),
     (
+        # Durable work queue for the incremental publish flow
+        # (agent_email/cluster_publish.py). One row per new email per
+        # affected cluster. Deliberately has NO status column: a row exists
+        # until its cluster is fully published (DB + Weaviate + Redis), then
+        # it is deleted. retry_count is the only bookkeeping.
+        "cluster_publish_staging",
+        """
+        CREATE TABLE IF NOT EXISTS cluster_publish_staging (
+            id               BIGSERIAL PRIMARY KEY,
+            run_id           TEXT NOT NULL,
+            cluster_id       TEXT NOT NULL,
+            email_message_id TEXT NOT NULL,
+            email_subject    TEXT,
+            cluster_action   TEXT NOT NULL
+                CONSTRAINT ck_cluster_publish_staging_action
+                CHECK (cluster_action IN ('NEW_CLUSTER', 'UPDATED_CLUSTER')),
+            retry_count      INTEGER NOT NULL DEFAULT 0,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT uq_cluster_publish_staging_run_cluster_email
+                UNIQUE (run_id, cluster_id, email_message_id)
+        );
+        """,
+    ),
+    (
         "email_topics",
         """
         CREATE TABLE IF NOT EXISTS email_topics (
@@ -240,6 +265,22 @@ EMAIL_INDEX_DDL: list[tuple[str, str]] = [
         "idx_email_clusters_weaviate_id",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_email_clusters_weaviate_id "
         "ON email_clusters (weaviate_id) WHERE weaviate_id IS NOT NULL;",
+    ),
+    (
+        "idx_cluster_publish_staging_run_cluster",
+        "CREATE INDEX IF NOT EXISTS idx_cluster_publish_staging_run_cluster "
+        "ON cluster_publish_staging (run_id, cluster_id);",
+    ),
+    (
+        "idx_cluster_publish_staging_run_updated",
+        "CREATE INDEX IF NOT EXISTS idx_cluster_publish_staging_run_updated "
+        "ON cluster_publish_staging (run_id, updated_at);",
+    ),
+    (
+        # Dedup lookup: "is this message already staged under ANY run?"
+        "idx_cluster_publish_staging_message",
+        "CREATE INDEX IF NOT EXISTS idx_cluster_publish_staging_message "
+        "ON cluster_publish_staging (email_message_id);",
     ),
     (
         "idx_email_topics_run_id",
@@ -468,6 +509,12 @@ async def create_email_schema(conn) -> None:
          WHERE ec.cluster_id = ranked.cluster_id
            AND ranked.rn > 1
         """
+    )
+    # Publish run that last wrote this cluster's content (see
+    # agent_email/cluster_publish.py). Additive; legacy rows keep ''.
+    await conn.execute(
+        "ALTER TABLE email_clusters "
+        "ADD COLUMN IF NOT EXISTS run_id TEXT DEFAULT ''"
     )
     for _table in ("email_clusters", "meeting_embeddings", "meeting_history"):
         await conn.execute(

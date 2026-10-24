@@ -275,8 +275,11 @@ class EmailClusterRecord(BaseModel):
     # records default to active.
     is_active: int = 1
     updated_at: str = ""
- 
- 
+    # Pipeline/publish run that last wrote this record's content. Not part of
+    # the content hash, so it never forces a rewrite on its own.
+    run_id: str = ""
+
+
 class EmailSummarizerTestRequest(BaseModel):
     """Select either one Graph message or the latest N inbox messages."""
  

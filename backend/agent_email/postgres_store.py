@@ -123,7 +123,7 @@ async def read_all_cluster_records(
             SELECT cluster_id, department, topic, summary, top_questions,
                    action_items, email_refs, email_count, embedding,
                    meeting_id, anchored_meeting_id, meeting_start,
-                   is_active, updated_at
+                   is_active, updated_at, run_id
             FROM email_clusters
             {where}
             ORDER BY cluster_id
@@ -156,6 +156,7 @@ async def read_all_cluster_records(
                 meeting_start=r["meeting_start"] or "",
                 is_active=int(r["is_active"] if r["is_active"] is not None else 1),
                 updated_at=r["updated_at"].isoformat() if r["updated_at"] else "",
+                run_id=r["run_id"] or "",
             ))
         except Exception as exc:  # noqa: BLE001
             logger.warning("[PG] skipping malformed cluster row (cluster_id=%s): %s", r["cluster_id"], exc)
@@ -290,7 +291,7 @@ async def write_cluster_records(records: list[EmailClusterRecord], settings: Set
                 embedding_json, emb_model if embedding_json else "",
                 emb_dim if embedding_json else 0, new_hash,
                 rec.meeting_id, getattr(rec, "anchored_meeting_id", "") or "",
-                rec.meeting_start, is_active,
+                rec.meeting_start, is_active, getattr(rec, "run_id", "") or "",
             ))
 
         superseded_weaviate_ids: list[str] = []
@@ -331,9 +332,9 @@ async def write_cluster_records(records: list[EmailClusterRecord], settings: Set
                          action_items, email_refs, email_count, weaviate_id,
                          embedding, embedding_model, embedding_dim, content_hash,
                          meeting_id, anchored_meeting_id, meeting_start,
-                         is_active, updated_at)
+                         is_active, run_id, updated_at)
                     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,
-                            $10::jsonb,$11,$12,$13,$14,$15,$16,$17, now())
+                            $10::jsonb,$11,$12,$13,$14,$15,$16,$17,$18, now())
                     ON CONFLICT (cluster_id) DO UPDATE SET
                         department = EXCLUDED.department,
                         topic = EXCLUDED.topic,
@@ -351,6 +352,7 @@ async def write_cluster_records(records: list[EmailClusterRecord], settings: Set
                         anchored_meeting_id = EXCLUDED.anchored_meeting_id,
                         meeting_start = EXCLUDED.meeting_start,
                         is_active = EXCLUDED.is_active,
+                        run_id = EXCLUDED.run_id,
                         updated_at = now()
                     """,
                     prepared,

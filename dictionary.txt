@@ -1,0 +1,62 @@
+{
+  "BB&RL": [
+    "BB&RL branch banking and retail liabilities",
+    "BBRL",
+    "BBRL retail liabilities",
+    "retail CASA deposits",
+    "branch banking",
+    "branch term deposit mobilisation",
+    "retail savings and current account growth",
+    "retail CASA mobilisation",
+    "branch deposit growth",
+    "virtual RM VRM",
+    "retail liability book",
+    "retail CA/SA targets",
+    "retail term deposits",
+    "retail deposit base"
+  ],
+  "Credit Cards": [
+    "credit card spends",
+    "credit card acquisition",
+    "card acquisition and activation",
+    "card activation",
+    "interchange income",
+    "card EMI",
+    "card rewards",
+    "cards delinquency and collections",
+    "credit card portfolio"
+  ],
+  "Retail Advances - Excluding Credit Cards": [
+    "home loan disbursement",
+    "loan against property LAP",
+    "personal loan",
+    "microfinance JLG MFI collections",
+    "retail GNPA",
+    "secured and unsecured retail assets"
+  ],
+  "Wholesale Banking": [
+    "corporate advances",
+    "WB wholesale banking",
+    "large and mid corporate relationships",
+    "transaction banking",
+    "trade finance",
+    "treasury client coverage",
+    "wholesale deposits",
+    "wholesale CASA",
+    "wholesale CA/SA targets",
+    "WB CA/SA targets",
+    "WB CASA targets",
+    "wholesale current and savings accounts",
+    "FIGU and corporate CASA",
+    "cost of funds on the WB book",
+    "blended cost of funds",
+    "NIM pack funding cost assumption",
+    "wholesale deposit mix",
+    "market borrowing",
+    "funding cost assumption for the NIM pack",
+    "corporate credit turnaround time TAT",
+    "corporate credit underwriting",
+    "corporate proposal exception cases",
+    "corporate credit pipeline and sanctions"
+  ]
+}
